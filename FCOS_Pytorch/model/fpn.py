@@ -13,10 +13,12 @@ class FPN(nn.Module):
         self.conv_5 =nn.Conv2d(features, features, kernel_size=3, padding=1)
         self.conv_4 =nn.Conv2d(features, features, kernel_size=3, padding=1)
         self.conv_3 =nn.Conv2d(features, features, kernel_size=3, padding=1)
+
         if use_p5:
             self.conv_out6 = nn.Conv2d(features, features, kernel_size=3, padding=1, stride=2)
         else:
             self.conv_out6 = nn.Conv2d(2048, features, kernel_size=3, padding=1, stride=2)
+            
         self.conv_out7 = nn.Conv2d(features, features, kernel_size=3, padding=1, stride=2)
         self.use_p5=use_p5
         self.apply(self.init_conv_kaiming)

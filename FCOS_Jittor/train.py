@@ -8,6 +8,7 @@ import os
 import numpy as np
 import random
 import argparse
+from jittor import nn
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--epochs", type=int, default=1, help="number of epochs")
@@ -18,9 +19,9 @@ opt = parser.parse_args()
 
 # Jittor handles device placement automatically. Setting flags is the preferred way.
 # os.environ["CUDA_VISIBLE_DEVICES"] is not necessary as Jittor manages this internally.
-if 'CUDA_VISIBLE_DEVICES' in os.environ:
-    os.environ['CUDA_VISIBLE_DEVICES'] = opt.n_gpu
-    jt.flags.use_cuda = 1
+#if 'CUDA_VISIBLE_DEVICES' in os.environ:
+   # os.environ['CUDA_VISIBLE_DEVICES'] = opt.n_gpu
+jt.flags.use_cuda = 1
 
 # Setting seeds for reproducibility in Jittor
 jt.set_global_seed(0)
@@ -84,24 +85,53 @@ for epoch in range(EPOCHS):
     for epoch_step, data in enumerate(train_loader):
         # Data is already on the correct device with Jittor, no need for .cuda()
         batch_imgs, batch_boxes, batch_classes = data
-        
+        #print("batch_imgs.shape before model:", batch_imgs.shape)
+        #print(batch_imgs.dtype)
+
+
         lr = lr_func(GLOBAL_STEPS)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
         start_time = time.time()
+
+        # temporarily in training script before model call:
+        #print("cls_logits levels:", [p.shape for p in cls_logits])
+        #print("batch_boxes shape:", batch_boxes.shape, "batch_classes shape:", batch_classes.shape)
+        #print("cls_logits levels shapes:", [p.shape for p in batch_imgs[0]])
+        #print("batch_boxes:", batch_boxes.shape, "batch_classes:", batch_classes.shape)
+
+
         
         # Jittor's `execute()` method is called implicitly when the module is called.
         losses = model([batch_imgs, batch_boxes, batch_classes])
         loss = losses[-1]
+
+        # Extract individual losses (ensure these indices match your model's output)
+        cls_loss = losses[0].mean()
+        cnt_loss = losses[1].mean()
+        reg_loss = losses[2].mean()
+        total_loss = losses[-1].mean()  # Total loss
+        
+        # Check if current step has meaningful loss
+        if cls_loss.item() > 0 or cnt_loss.item() > 0 or reg_loss.item() > 0:
+            epoch_has_meaningful_loss = True
         
         # Forward and backward pass
-        optimizer.zero_grad()
-        loss.mean().backward()
+        #optimizer.zero_grad()
+        #optimizer.backward(loss.mean())
         
         # Gradient clipping
-        jt.grad.clip_grad_norm_(model.parameters(), 3)
-        optimizer.step()
+        #jt.grad.clip_grad_norm_(model.parameters(), 3)
+        #optimizer.step()
+
+        #jt.grad.clip_grad_norm_(model.parameters(),3)
+        #nn.clip_grad_norm_(model.parameters(),3)
+
+        optimizer.step(loss.mean())
+
+
+        
         
         end_time = time.time()
         cost_time = int((end_time - start_time) * 1000)
@@ -111,4 +141,15 @@ for epoch in range(EPOCHS):
 
         GLOBAL_STEPS += 1
     
-    jt.save(model.state_dict(), "./checkpoint/model_{}.pth".format(epoch + 1))
+    # Save model with corrected condition
+    # Check if training made progress (any loss component is positive)
+    if GLOBAL_STEPS > 0 and epoch_has_meaningful_loss:
+        try:
+            # Create checkpoint directory if it doesn't exist
+            os.makedirs("./checkpoint", exist_ok=True)
+            jt.save(model.state_dict(), f"./checkpoint/model_{epoch + 1}.pth")
+            print(f"Model saved successfully at epoch {epoch + 1}")
+        except Exception as e:
+            print(f"Error saving model: {str(e)}")
+    else:
+        print(f"Skipping model save at epoch {epoch + 1} - no meaningful training progress")

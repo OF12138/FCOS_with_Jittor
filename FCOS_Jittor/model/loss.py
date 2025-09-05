@@ -1,324 +1,410 @@
 import jittor as jt
 import jittor.nn as nn
 from .config import DefaultConfig
-import math
 
 def coords_fmap2orig(feature, stride):
-    '''
-    transfor one fmap coords to orig coords
-    Args
-    feature [batch_size,h,w,c]
-    stride int
-    Returns 
-    coords [n,2]
-    '''
-    h, w = feature.shape[1:3]
-    shifts_x = jt.arange(0, w * stride, stride, dtype=jt.float32)
-    shifts_y = jt.arange(0, h * stride, stride, dtype=jt.float32)
-
-    shift_y, shift_x = jt.meshgrid(shifts_y, shifts_x)
-    shift_x = jt.reshape(shift_x, [-1])
-    shift_y = jt.reshape(shift_y, [-1])
-    coords = jt.stack([shift_x, shift_y], -1) + stride // 2
+    """
+    Convert feature map coordinates to image coordinates (pixel units).
+    feature: [B, C, H, W] or [C, H, W]
+    stride: int, stride of this feature map relative to the image
+    return: coords [HW, 2] in (x, y) order, aligned with image pixel centers
+    """
+    h, w = feature.shape[-2:]   # always take last two dims
+    shifts_x = jt.arange(0, w, dtype=jt.float32) + 0.5
+    shifts_y = jt.arange(0, h, dtype=jt.float32) + 0.5
+    shifts_x = shifts_x * stride
+    shifts_y = shifts_y * stride
+    shift_y, shift_x = jt.meshgrid(shifts_y, shifts_x)  # [H,W]
+    shift_x = shift_x.reshape([-1])
+    shift_y = shift_y.reshape([-1])
+    coords = jt.stack([shift_x, shift_y], dim=-1)  # [HW,2]
     return coords
 
+
+# -------------------- Target generation --------------------
 class GenTargets(nn.Module):
     def __init__(self, strides, limit_range):
         super().__init__()
         self.strides = strides
         self.limit_range = limit_range
-        assert len(strides) == len(limit_range)
+        #assert len(self.strides) == len(self.limit_range) ###
 
     def execute(self, inputs):
-        '''
-        inputs  
-        [0]list [cls_logits,cnt_logits,reg_preds]  
-        cls_logits  list contains five [batch_size,class_num,h,w]  
-        cnt_logits  list contains five [batch_size,1,h,w]  
-        reg_preds   list contains five [batch_size,4,h,w]  
-        [1]gt_boxes [batch_size,m,4]  FloatTensor  
-        [2]classes [batch_size,m]  LongTensor
-        Returns
-        cls_targets:[batch_size,sum(_h*_w),1]
-        cnt_targets:[batch_size,sum(_h*_w),1]
-        reg_targets:[batch_size,sum(_h*_w),4]
-        '''
         cls_logits, cnt_logits, reg_preds = inputs[0]
-        gt_boxes = inputs[1]
-        classes = inputs[2]
-        cls_targets_all_level = []
-        cnt_targets_all_level = []
-        reg_targets_all_level = []
-        assert len(self.strides) == len(cls_logits)
-        for level in range(len(cls_logits)):
-            level_out = [cls_logits[level], cnt_logits[level], reg_preds[level]]
-            level_targets = self._gen_level_targets(level_out, gt_boxes, classes, self.strides[level],
-                                                     self.limit_range[level])
-            cls_targets_all_level.append(level_targets[0])
-            cnt_targets_all_level.append(level_targets[1])
-            reg_targets_all_level.append(level_targets[2])
-            
-        return jt.concat(cls_targets_all_level, dim=1), jt.concat(cnt_targets_all_level, dim=1), jt.concat(reg_targets_all_level, dim=1)
+        gt_boxes, classes = inputs[1], inputs[2]
 
-    def _gen_level_targets(self, out, gt_boxes, classes, stride, limit_range, sample_radiu_ratio=1.5):
-        '''
-        Args  
-        out list contains [[batch_size,class_num,h,w],[batch_size,1,h,w],[batch_size,4,h,w]]  
-        gt_boxes [batch_size,m,4]  
-        classes [batch_size,m]  
-        stride int  
-        limit_range list [min,max]  
-        Returns  
-        cls_targets,cnt_targets,reg_targets
-        '''
-        cls_logits, cnt_logits, reg_preds = out
-        batch_size = cls_logits.shape[0]
-        class_num = cls_logits.shape[1]
-        m = gt_boxes.shape[1]
+        cls_targets_all, cnt_targets_all, reg_targets_all = [], [], []
+        for lvl, stride in enumerate(self.strides):
+            cls_t, cnt_t, reg_t = self._gen_level_targets(
+                cls_logits[lvl], gt_boxes, classes,
+                stride, self.limit_range[lvl]
+            )
+            cls_targets_all.append(cls_t)
+            cnt_targets_all.append(cnt_t)
+            reg_targets_all.append(reg_t)
 
-        cls_logits = cls_logits.permute(0, 2, 3, 1)  # [batch_size,h,w,class_num]  
-        coords = coords_fmap2orig(cls_logits, stride)  # [h*w,2]
+        return (jt.concat(cls_targets_all, dim=1),
+                jt.concat(cnt_targets_all, dim=1),
+                jt.concat(reg_targets_all, dim=1))
 
-        cls_logits = cls_logits.reshape((batch_size, -1, class_num))  # [batch_size,h*w,class_num]  
-        cnt_logits = cnt_logits.permute(0, 2, 3, 1)
-        cnt_logits = cnt_logits.reshape((batch_size, -1, 1))
-        reg_preds = reg_preds.permute(0, 2, 3, 1)
-        reg_preds = reg_preds.reshape((batch_size, -1, 4))
+    def _gen_level_targets(self, feature_map, gt_boxes, classes, stride, limit_range, sample_radius_ratio=3.0 ):
+        B, _, H, W = feature_map.shape
+        HW = H * W
+        min_range, max_range = float(limit_range[0]), float(limit_range[1])
 
-        h_mul_w = cls_logits.shape[1]
+        # coords on original image
+        shifts_x = jt.arange(0, W * stride, stride, dtype="float32") + stride/2.0
+        shifts_y = jt.arange(0, H * stride, stride, dtype="float32") + stride/2.0
+        shift_y, shift_x = jt.meshgrid(shifts_y, shifts_x)
+        coords = jt.stack([shift_x.reshape(-1), shift_y.reshape(-1)], dim=-1)  # (HW, 2)
 
-        x = coords[:, 0]
-        y = coords[:, 1]
-        l_off = x[None, :, None] - gt_boxes[..., 0][:, None, :]  # [1,h*w,1]-[batch_size,1,m]-->[batch_size,h*w,m]
-        t_off = y[None, :, None] - gt_boxes[..., 1][:, None, :]
-        r_off = gt_boxes[..., 2][:, None, :] - x[None, :, None]
-        b_off = gt_boxes[..., 3][:, None, :] - y[None, :, None]
-        ltrb_off = jt.stack([l_off, t_off, r_off, b_off], dim=-1)  # [batch_size,h*w,m,4]
+        cls_list, cnt_list, reg_list = [], [], []
+        INF = 1e10
 
-        areas = (ltrb_off[..., 0] + ltrb_off[..., 2]) * (ltrb_off[..., 1] + ltrb_off[..., 3])  # [batch_size,h*w,m]
+        for b in range(B):
+            boxes_b, cls_b = gt_boxes[b], classes[b]
+            valid_mask = (cls_b >= 0)
+            if valid_mask.sum().item() == 0:
+                cls_list.append(jt.zeros((HW,1), dtype="int32"))
+                cnt_list.append(jt.ones((HW,1), dtype="float32") * -1.0)
+                reg_list.append(jt.ones((HW,4), dtype="float32") * -1.0)
+                continue
 
-        off_min = jt.min(ltrb_off, dim=-1)[0]  # [batch_size,h*w,m]
-        off_max = jt.max(ltrb_off, dim=-1)[0]  # [batch_size,h*w,m]
+            boxes_valid = boxes_b[valid_mask]                # (m,4)
+            cls_valid = cls_b[valid_mask].int32()            # (m,)
+            m = int(boxes_valid.shape[0])
+            if m == 0:
+                cls_list.append(jt.zeros((HW,1), dtype="int32"))
+                cnt_list.append(jt.ones((HW,1), dtype="float32") * -1.0)
+                reg_list.append(jt.ones((HW,4), dtype="float32") * -1.0)
+                continue
 
-        mask_in_gtboxes = off_min > 0
-        mask_in_level = (off_max > limit_range[0]) & (off_max <= limit_range[1])
+            # expand
+            coords_exp = coords.unsqueeze(1).repeat(1, m, 1)        # (HW, m, 2)
+            boxes_exp = boxes_valid.unsqueeze(0).repeat(HW, 1, 1)   # (HW, m, 4)
 
-        radiu = stride * sample_radiu_ratio
-        gt_center_x = (gt_boxes[..., 0] + gt_boxes[..., 2]) / 2
-        gt_center_y = (gt_boxes[..., 1] + gt_boxes[..., 3]) / 2
-        c_l_off = x[None, :, None] - gt_center_x[:, None, :]  # [1,h*w,1]-[batch_size,1,m]-->[batch_size,h*w,m]
-        c_t_off = y[None, :, None] - gt_center_y[:, None, :]
-        c_r_off = gt_center_x[:, None, :] - x[None, :, None]
-        c_b_off = gt_center_y[:, None, :] - y[None, :, :]
-        c_ltrb_off = jt.stack([c_l_off, c_t_off, c_r_off, c_b_off], dim=-1)  # [batch_size,h*w,m,4]
-        c_off_max = jt.max(c_ltrb_off, dim=-1)[0]
-        mask_center = c_off_max < radiu
+            x = coords_exp[..., 0]
+            y = coords_exp[..., 1]
+            l = x - boxes_exp[..., 0]
+            t = y - boxes_exp[..., 1]
+            r = boxes_exp[..., 2] - x
+            b_ = boxes_exp[..., 3] - y
+            ltrb = jt.stack([l, t, r, b_], dim=-1)  # (HW, m, 4)
 
-        mask_pos = mask_in_gtboxes & mask_in_level & mask_center  # [batch_size,h*w,m]
+            # inside-box mask
+            off_min = ltrb.min(dim=-1)[0]  # (HW, m)
+            mask_in_box = off_min >= -1
 
-        areas = jt.where(mask_pos, areas, jt.ones_like(areas) * 99999999)
-        areas_min_ind = jt.argmin(areas, dim=-1)  # [batch_size,h*w]
-        
-        reg_targets = ltrb_off.gather(dim=-1, index=areas_min_ind.unsqueeze(dim=-1).repeat(1,1,4), keepdim=False)  # [batch_size*h*w,4]
-        reg_targets = jt.reshape(reg_targets, (batch_size, -1, 4))  # [batch_size,h*w,4]
-        
-        classes = classes.unsqueeze(1).repeat(1, h_mul_w, 1) # [batch_size,h*w,m]
-        cls_targets = classes.gather(dim=-1, index=areas_min_ind.unsqueeze(dim=-1), keepdim=False)
-        cls_targets = jt.reshape(cls_targets, (batch_size, -1, 1))  # [batch_size,h*w,1]
+                # 1. Relax mask_in_box criteria
+            # Original: mask_in_box = (x >= xmin) & (x <= xmax) & (y >= ymin) & (y <= ymax)
+            # New: Allow some tolerance outside the box
+            #tolerance = stride * 0.5  # Add small tolerance
+            #mask_in_box = (x >= (xmin - tolerance)) & (x <= (xmax + tolerance)) & \
+                        #(y >= (ymin - tolerance)) & (y <= (ymax + tolerance))
 
-        left_right_min = jt.min(reg_targets[..., 0], reg_targets[..., 2])  # [batch_size,h*w]
-        left_right_max = jt.max(reg_targets[..., 0], reg_targets[..., 2])
-        top_bottom_min = jt.min(reg_targets[..., 1], reg_targets[..., 3])
-        top_bottom_max = jt.max(reg_targets[..., 1], reg_targets[..., 3])
-        cnt_targets = ((left_right_min * top_bottom_min) / (left_right_max * top_bottom_max + 1e-10)).sqrt().unsqueeze(dim=-1)  # [batch_size,h*w,1]
+            # range mask (max offset)
+            off_max = ltrb.max(dim=-1)[0]  # (HW, m)
+            mask_in_level = (off_max > min_range) & (off_max <= max_range)
 
-        assert reg_targets.shape == (batch_size, h_mul_w, 4)
-        assert cls_targets.shape == (batch_size, h_mul_w, 1)
-        assert cnt_targets.shape == (batch_size, h_mul_w, 1)
+            # center sample mask
+            cx = (boxes_valid[:, 0] + boxes_valid[:, 2]) / 2.0  # (m,)
+            cy = (boxes_valid[:, 1] + boxes_valid[:, 3]) / 2.0  # (m,)
+            cx_exp = cx.unsqueeze(0).repeat(HW, 1)
+            cy_exp = cy.unsqueeze(0).repeat(HW, 1)
+            c_l = x - cx_exp
+            c_t = y - cy_exp
+            c_r = cx_exp - x
+            c_b = cy_exp - y
+            c_off_max = jt.stack([c_l, c_t, c_r, c_b], dim=-1).max(dim=-1)[0]  # (HW,m)
+            radius = stride * sample_radius_ratio
+            mask_center = c_off_max < radius
 
-        # process neg coords
-        mask_pos_2 = jt.sum(mask_pos.int(), dim=-1)  # [batch_size,h*w]
-        mask_pos_2 = mask_pos_2 >= 1
-        assert mask_pos_2.shape == (batch_size, h_mul_w)
-        
-        # Jittor indexing for assigning values
-        cls_targets = jt.where(mask_pos_2.unsqueeze(-1), cls_targets, jt.zeros_like(cls_targets))
-        cnt_targets = jt.where(mask_pos_2.unsqueeze(-1), cnt_targets, jt.ones_like(cnt_targets) * -1)
-        reg_targets = jt.where(mask_pos_2.unsqueeze(-1).repeat(1,1,4), reg_targets, jt.ones_like(reg_targets) * -1)
-        
-        return cls_targets, cnt_targets, reg_targets
+            pos_mask = mask_in_box & mask_in_level #& mask_center  # (HW, m)
 
+            if pos_mask.sum() == 0:
+                radius_relaxed = radius * 2.0
+                mask_center_relaxed = c_off_max < radius_relaxed
+                pos_mask = mask_in_box & mask_in_level & mask_center_relaxed
+                print(f"Warning: No positives with strict center sampling (stride={stride}), using relaxed radius {radius_relaxed}")
+
+
+
+            # area per gt broadcasted
+            areas = ((boxes_valid[:, 2] - boxes_valid[:, 0]) * (boxes_valid[:, 3] - boxes_valid[:, 1]))  # (m,)
+            areas_exp = areas.unsqueeze(0).repeat(HW, 1)  # (HW, m)
+            areas_valid = jt.where(pos_mask, areas_exp, jt.ones_like(areas_exp) * INF)  # (HW, m)
+
+            # --- DEBUG: add right after pos_mask is computed ---
+            if b == 0:
+                try:
+                    # Basic shapes / counts
+                    print(f" stride={stride} HxW={H}x{W} boxes_valid.shape={boxes_valid.shape} m={m}")
+                    print(" sample boxes_valid (first 5):",
+                        boxes_valid[:5].numpy().tolist() if boxes_valid.numel() > 0 else [])
+                    # mask sums
+                    mib = int(mask_in_box.sum().item())
+                    mil = int(mask_in_level.sum().item())
+                    mc  = int(mask_center.sum().item())
+                    pm  = int(pos_mask.sum().item())
+                    print(" mask_in_box.sum=", mib, " mask_in_level.sum=", mil, " mask_center.sum=", mc, " pos_mask.sum=", pm)
+
+                    # area stats
+                    if areas_exp.numel() > 0 and m > 0:
+                        areas_np = areas_exp.reshape(-1).numpy()
+                        print(" area min/max:", float(areas_np.min()), float(areas_np.max()))
+                    # show a few coords vs box centers for manual check
+                    coords_np = coords.numpy() if coords.numel() > 0 else None
+                    if coords_np is not None:
+                        print(" coords sample (first 5):", coords_np[:5].tolist())
+                        # show first box center
+                        if boxes_valid.numel() > 0:
+                            first_box = boxes_valid[0].numpy().tolist()
+                            cx = (first_box[0] + first_box[2]) / 2.0
+                            cy = (first_box[1] + first_box[3]) / 2.0
+                            print(" first_box:", first_box, " center:", [cx, cy])
+                except Exception as e:
+                    print("DEBUG PRINT ERROR:", e)
+
+
+            # get index of min area per location using argmin
+            argmin_res = jt.argmin(areas_valid, dim=1)
+            if isinstance(argmin_res, tuple):
+                min_inds = argmin_res[1].int32()
+            else:
+                min_inds = argmin_res.int32()
+
+            # ---- DEFENSIVE CLAMP: ensure indices in [0, m-1] before any gather/getitem ----
+            # convert to int32 and clamp
+            min_inds = min_inds.astype(jt.int32)
+            min_inds = jt.minimum(jt.maximum(min_inds, jt.zeros_like(min_inds)), jt.ones_like(min_inds) * (m - 1))
+            # ---------------------------------------------------------------------------
+
+            # now get min values by gather (safe because indices clamped)
+            min_vals = areas_valid.gather(1, min_inds.unsqueeze(1)).squeeze(1)  # (HW,)
+
+            # prepare default outputs
+            cls_target = jt.zeros((HW, 1), dtype="int32")
+            cnt_target = jt.ones((HW, 1), dtype="float32") * -1.0
+            reg_target = jt.ones((HW, 4), dtype="float32") * -1.0
+
+            # positive location mask (found a real gt)
+            pos_loc_mask = min_vals < INF  # (HW,)
+            if pos_loc_mask.sum().item() > 0:
+                # Only operate on positive locations to avoid any accidental use of clamped indices
+                pos_indices = pos_loc_mask.nonzero().squeeze()
+                if pos_indices.numel() == 0:
+                    # defensive fallback
+                    cls_list.append(cls_target); cnt_list.append(cnt_target); reg_list.append(reg_target)
+                    continue
+
+                # gather reg values for selected gt per positive location
+                # build per-positive indices safely
+                min_inds_pos = min_inds[pos_indices]  # (P,)
+                # build gather indices aligned with ltrb shape: (P,1,4)
+                idx_for_gather = min_inds_pos.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 4)
+                # gather from ltrb at positive row positions
+                reg_selected_all = ltrb.gather(1, idx_for_gather)  # (HW,1,4) but we'll index by pos_indices
+                reg_selected = reg_selected_all[pos_indices].squeeze(1)  # (P,4)
+
+                # class selected
+                cls_selected = cls_valid.gather(0, min_inds_pos).reshape(-1, 1).int32()  # (P,1)
+
+                # centerness calculation for positives
+                lr_min = jt.minimum(reg_selected[:, 0], reg_selected[:, 2])
+                lr_max = jt.maximum(reg_selected[:, 0], reg_selected[:, 2])
+                tb_min = jt.minimum(reg_selected[:, 1], reg_selected[:, 3])
+                tb_max = jt.maximum(reg_selected[:, 1], reg_selected[:, 3])
+                centerness_all = jt.sqrt((lr_min * tb_min) / (lr_max * tb_max + 1e-10)).unsqueeze(1)  # (P,1)
+
+                # write selected values into full tensors at positive positions
+                cls_target = cls_target  # (HW,1)
+                reg_target = reg_target  # (HW,4)
+                cnt_target = cnt_target  # (HW,1)
+
+                # assign values using boolean indexing: safer than gather with questionable indices
+                cls_target = cls_target.scatter(0, pos_indices.unsqueeze(1).astype(jt.int32), cls_selected)
+                reg_target = reg_target.scatter(0, pos_indices.unsqueeze(1).repeat(1,4).astype(jt.int32), reg_selected)
+                cnt_target = cnt_target.scatter(0, pos_indices.unsqueeze(1).astype(jt.int32), centerness_all)
+
+            cls_list.append(cls_target)
+            cnt_list.append(cnt_target)
+            reg_list.append(reg_target)
+
+        return jt.stack(cls_list, 0), jt.stack(cnt_list, 0), jt.stack(reg_list, 0)
+
+# -------------------- Loss functions --------------------
 def compute_cls_loss(preds, targets, mask):
-    '''
-    Args  
-    preds: list contains five level pred [batch_size,class_num,_h,_w]
-    targets: [batch_size,sum(_h*_w),1]
-    mask: [batch_size,sum(_h*_w)]
-    '''
+    """
+    preds: list of 5 levels [B, C, H, W]
+    targets: [B, sum(HW), 1]
+    mask: [B, sum(HW)]
+    """
     batch_size = targets.shape[0]
     preds_reshape = []
     class_num = preds[0].shape[1]
     mask = mask.unsqueeze(dim=-1)
-    
-    num_pos = jt.sum(mask.float(), dim=[1, 2]).clamp(min=1)
-    
+
+    # number of positives per batch, clamp to avoid div/0
+    num_pos = jt.sum(mask.float(), dims=[1, 2]).clamp(min_v=1)
+
     for pred in preds:
-        pred = pred.permute(0, 2, 3, 1)
-        pred = jt.reshape(pred, [batch_size, -1, class_num])
+        pred = pred.permute(0, 2, 3, 1)            # [B, H, W, C]
+        pred = pred.reshape(batch_size, -1, class_num)
         preds_reshape.append(pred)
-    preds = jt.concat(preds_reshape, dim=1)  # [batch_size,sum(_h*_w),class_num]
+    preds = jt.concat(preds_reshape, dim=1)        # [B, sum(HW), C]
     assert preds.shape[:2] == targets.shape[:2]
-    
+
     loss = []
-    for batch_index in range(batch_size):
-        pred_pos = preds[batch_index]  # [sum(_h*_w),class_num]
-        target_pos = targets[batch_index]  # [sum(_h*_w),1]
-        target_pos = (jt.arange(1, class_num + 1)[None, :] == target_pos).float() # sparse-->onehot
-        loss.append(focal_loss_from_logits(pred_pos, target_pos).view(1))
-    
-    return jt.concat(loss, dim=0) / num_pos  # [batch_size,]
+    for b in range(batch_size):
+        target_pos = targets[b]                    # [sum(HW), 1]
+        if mask[b].sum().item() == 0:              # <-- guard
+            loss.append(jt.zeros(1))
+            continue
+
+        # one-hot encode
+        target_pos = (jt.arange(0, class_num)[None, :] == target_pos).float()
+        pred_pos = preds[b]                        # [sum(HW), C]
+        loss.append(focal_loss_from_logits(pred_pos, target_pos).reshape(1))
+
+    return jt.concat(loss, dim=0) / num_pos        # [B,]
+
 
 def compute_cnt_loss(preds, targets, mask):
-    '''
-    Args  
-    preds: list contains five level pred [batch_size,1,_h,_w]
-    targets: [batch_size,sum(_h*_w),1]
-    mask: [batch_size,sum(_h*_w)]
-    '''
+    """
+    preds: list of 5 levels [B, 1, H, W]
+    targets: [B, sum(HW), 1]
+    mask: [B, sum(HW)]
+    """
     batch_size = targets.shape[0]
     c = targets.shape[-1]
     preds_reshape = []
     mask = mask.unsqueeze(dim=-1)
-    num_pos = jt.sum(mask.float(), dim=[1, 2]).clamp(min=1)
-    for pred in preds:
-        pred = pred.permute(0, 2, 3, 1)
-        pred = jt.reshape(pred, [batch_size, -1, c])
-        preds_reshape.append(pred)
-    preds = jt.concat(preds_reshape, dim=1)
-    assert preds.shape == targets.shape  # [batch_size,sum(_h*_w),1]
-    loss = []
-    for batch_index in range(batch_size):
-        pred_pos = preds[batch_index][mask[batch_index]].squeeze()  # [num_pos_b,]
-        target_pos = targets[batch_index][mask[batch_index]].squeeze()  # [num_pos_b,]
-        loss.append(nn.binary_cross_entropy_with_logits(x=pred_pos, target=target_pos, reduction='sum').view(1))
-    return jt.concat(loss, dim=0) / num_pos  # [batch_size,]
 
-def compute_reg_loss(preds, targets, mask, mode='giou'):
-    '''
-    Args  
-    preds: list contains five level pred [batch_size,4,_h,_w]
-    targets: [batch_size,sum(_h*_w),4]
-    mask: [batch_size,sum(_h*_w)]
-    '''
+    num_pos = jt.sum(mask.float(), dims=[1, 2]).clamp(min_v=1)
+
+    for pred in preds:
+        pred = pred.permute(0, 2, 3, 1)            # [B, H, W, 1]
+        pred = pred.reshape(batch_size, -1, c)
+        preds_reshape.append(pred)
+    preds = jt.concat(preds_reshape, dim=1)        # [B, sum(HW), 1]
+    assert preds.shape == targets.shape
+
+    loss = []
+    for b in range(batch_size):
+        pred_pos = preds[b][mask[b]]
+        target_pos = targets[b][mask[b]]
+
+        if pred_pos.numel() == 0:                  # <-- guard
+            loss.append(jt.zeros(1))
+        else:
+            loss.append(
+                nn.binary_cross_entropy_with_logits(
+                    output=pred_pos, target=target_pos, size_average=False
+                ).reshape(1)
+            )
+    return jt.concat(loss, dim=0) / num_pos
+
+
+def compute_reg_loss(preds, targets, mask, mode="giou"):
+    """
+    preds: list of 5 levels [B, 4, H, W]
+    targets: [B, sum(HW), 4]
+    mask: [B, sum(HW)]
+    """
     batch_size = targets.shape[0]
     c = targets.shape[-1]
     preds_reshape = []
-    num_pos = jt.sum(mask.float(), dim=1).clamp(min=1)
+    num_pos = jt.sum(mask.float(), dim=1).clamp(min_v=1)
+
     for pred in preds:
-        pred = pred.permute(0, 2, 3, 1)
-        pred = jt.reshape(pred, [batch_size, -1, c])
+        pred = pred.permute(0, 2, 3, 1)            # [B, H, W, 4]
+        pred = pred.reshape(batch_size, -1, c)
         preds_reshape.append(pred)
-    preds = jt.concat(preds_reshape, dim=1)
-    assert preds.shape == targets.shape  # [batch_size,sum(_h*_w),4]
+    preds = jt.concat(preds_reshape, dim=1)        # [B, sum(HW), 4]
+    assert preds.shape == targets.shape
+
     loss = []
-    for batch_index in range(batch_size):
-        pred_pos = preds[batch_index][mask[batch_index]]  # [num_pos_b,4]
-        target_pos = targets[batch_index][mask[batch_index]]  # [num_pos_b,4]
-        if mode == 'iou':
-            loss.append(iou_loss(pred_pos, target_pos).view(1))
-        elif mode == 'giou':
-            loss.append(giou_loss(pred_pos, target_pos).view(1))
+    for b in range(batch_size):
+        pred_pos = preds[b][mask[b]]
+        target_pos = targets[b][mask[b]]
+
+        if pred_pos.numel() == 0:                  # <-- guard
+            loss.append(jt.zeros(1))
         else:
-            raise NotImplementedError("reg loss only implemented ['iou','giou']")
-    return jt.concat(loss, dim=0) / num_pos  # [batch_size,]
+            if mode == "iou":
+                loss.append(iou_loss(pred_pos, target_pos).reshape(1))
+            elif mode == "giou":
+                loss.append(giou_loss(pred_pos, target_pos).reshape(1))
+            else:
+                raise NotImplementedError("reg loss only supports ['iou','giou']")
+    return jt.concat(loss, dim=0) / num_pos
+
 
 def iou_loss(preds, targets):
-    '''
-    Args:
-    preds: [n,4] ltrb
-    targets: [n,4]
-    '''
-    lt = jt.min(preds[:, :2], targets[:, :2])
-    rb = jt.min(preds[:, 2:], targets[:, 2:])
-    wh = (rb + lt).clamp(min_v=0)
-    overlap = wh[:, 0] * wh[:, 1]  # [n]
-    area1 = (preds[:, 2] + preds[:, 0]) * (preds[:, 3] + preds[:, 1])
-    area2 = (targets[:, 2] + targets[:, 0]) * (targets[:, 3] + targets[:, 1])
-    union = area1 + area2 - overlap
-    iou = overlap / union
-    loss = -iou.clamp(min_v=1e-6).log()
-    return loss.sum()
+    lt = jt.minimum(preds[:,:2], targets[:,:2])
+    rb = jt.minimum(preds[:,2:], targets[:,2:])
+    wh = (rb+lt).clamp(min_v=0)
+    overlap = wh[:,0]*wh[:,1]
+    area1 = (preds[:,2]+preds[:,0])*(preds[:,3]+preds[:,1])
+    area2 = (targets[:,2]+targets[:,0])*(targets[:,3]+targets[:,1])
+    iou = overlap/(area1+area2-overlap+1e-10)
+    return -(iou.clamp(min_v=1e-6)).log().sum()
 
 def giou_loss(preds, targets):
-    '''
-    Args:
-    preds: [n,4] ltrb
-    targets: [n,4]
-    '''
-    lt_min = jt.min(preds[:, :2], targets[:, :2])
-    rb_min = jt.min(preds[:, 2:], targets[:, 2:])
-    wh_min = (rb_min + lt_min).clamp(min_v=0)
-    overlap = wh_min[:, 0] * wh_min[:, 1]  # [n]
-    area1 = (preds[:, 2] + preds[:, 0]) * (preds[:, 3] + preds[:, 1])
-    area2 = (targets[:, 2] + targets[:, 0]) * (targets[:, 3] + targets[:, 1])
-    union = (area1 + area2 - overlap)
-    iou = overlap / union
+    lt_min = jt.minimum(preds[:,:2], targets[:,:2])
+    rb_min = jt.minimum(preds[:,2:], targets[:,2:])
+    wh_min = (rb_min+lt_min).clamp(min_v=0)
+    overlap = wh_min[:,0]*wh_min[:,1]
+    area1 = (preds[:,2]+preds[:,0])*(preds[:,3]+preds[:,1])
+    area2 = (targets[:,2]+targets[:,0])*(targets[:,3]+targets[:,1])
+    union = area1+area2-overlap
+    iou = overlap/(union+1e-10)
 
-    lt_max = jt.max(preds[:, :2], targets[:, :2])
-    rb_max = jt.max(preds[:, 2:], targets[:, 2:])
-    wh_max = (rb_max + lt_max).clamp(min_v=0)
-    G_area = wh_max[:, 0] * wh_max[:, 1]  # [n]
-
-    giou = iou - (G_area - union) / G_area.clamp(min_v=1e-10)
-    loss = 1. - giou
-    return loss.sum()
+    lt_max = jt.maximum(preds[:,:2], targets[:,:2])
+    rb_max = jt.maximum(preds[:,2:], targets[:,2:])
+    wh_max = (rb_max+lt_max).clamp(min_v=0)
+    G_area = wh_max[:,0]*wh_max[:,1]
+    giou = iou-(G_area-union)/(G_area+1e-10)
+    return (1-giou).sum()
 
 def focal_loss_from_logits(preds, targets, gamma=2.0, alpha=0.25):
-    '''
-    Args:
-    preds: [n,class_num] 
-    targets: [n,class_num]
-    '''
     preds = preds.sigmoid()
-    pt = preds * targets + (1.0 - preds) * (1.0 - targets)
-    w = alpha * targets + (1.0 - alpha) * (1.0 - targets)
-    loss = -w * jt.pow((1.0 - pt), gamma) * pt.log()
-    return loss.sum()
+    pt = preds*targets + (1-preds)*(1-targets)
+    w = alpha*targets + (1-alpha)*(1-targets)
+    return (-w * (1-pt).pow(gamma) * (pt+1e-12).log()).sum()
 
+# -------------------- Loss wrapper --------------------
 class LOSS(nn.Module):
     def __init__(self, config=None):
         super().__init__()
-        if config is None:
-            self.config = DefaultConfig
-        else:
-            self.config = config
+        self.config = DefaultConfig if config is None else config
 
     def execute(self, inputs):
-        '''
-        inputs list
-        [0]preds:  ....
-        [1]targets : list contains three elements [[batch_size,sum(_h*_w),1],[batch_size,sum(_h*_w),1],[batch_size,sum(_h*_w),4]]
-        '''
         preds, targets = inputs
         cls_logits, cnt_logits, reg_preds = preds
         cls_targets, cnt_targets, reg_targets = targets
-        mask_pos = (cnt_targets > -1).squeeze(dim=-1)  # [batch_size,sum(_h*_w)]
-        cls_loss = compute_cls_loss(cls_logits, cls_targets, mask_pos).mean()
-        cnt_loss = compute_cnt_loss(cnt_logits, cnt_targets, mask_pos).mean()
-        reg_loss = compute_reg_loss(reg_preds, reg_targets, mask_pos).mean()
-        if self.config.add_centerness:
-            total_loss = cls_loss + cnt_loss + reg_loss
-            return cls_loss, cnt_loss, reg_loss, total_loss
-        else:
-            total_loss = cls_loss + reg_loss + cnt_loss * 0.0
-            return cls_loss, cnt_loss, reg_loss, total_loss
+        mask = (cnt_targets > -1)
+        if mask.ndim==3: mask = mask.squeeze(-1)
 
-if __name__ == "__main__":
-    # Create Jittor tensors for the example
-    preds_example = [jt.ones([2, 1, 4, 4])] * 5
-    targets_example = jt.ones([2, 80, 1])
-    mask_example = jt.ones([2, 80], dtype=jt.bool)
-    
-    # Run the compute_cnt_loss function with Jittor tensors
-    loss = compute_cnt_loss(preds_example, targets_example, mask_example)
-    print(loss)
+        cls_loss = compute_cls_loss(cls_logits, cls_targets, mask).mean()
+        cnt_loss = compute_cnt_loss(cnt_logits, cnt_targets, mask).mean()
+        reg_loss = compute_reg_loss(reg_preds, reg_targets, mask).mean()
+
+        if self.config.add_centerness:
+            total = cls_loss+cnt_loss+reg_loss
+        else:
+            total = cls_loss+reg_loss
+
+        # ---- DEBUG ----
+        try:
+            print(
+                "mask.sum():", mask.sum().item(),
+                "cls_targets unique:", jt.unique(cls_targets).numpy()[:10],
+                "cnt_targets min/max:", float(cnt_targets.min().item()), float(cnt_targets.max().item()),
+                "reg_targets mean:", float(reg_targets.mean().item()),
+            )
+        except Exception as e:
+            print("[DEBUG PRINT FAILED]", e)
+        # --------------
+
+        return cls_loss, cnt_loss, reg_loss, total

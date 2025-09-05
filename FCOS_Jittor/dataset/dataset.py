@@ -1,24 +1,67 @@
 import jittor as jt
-import jittor.dataset as datasets
+from jittor.dataset import Dataset
 import jittor.transform as transforms
+from pycocotools.coco import COCO
 import numpy as np
 import cv2
 from PIL import Image
 import random
+import os
+from model.config import DefaultConfig
 
 
+# -----------------------------
+# Utils
+# -----------------------------
 def flip(img, boxes):
+    """Flip an image and its bounding boxes horizontally."""
     img = img.transpose(Image.FLIP_LEFT_RIGHT)
     w = img.width
     if boxes.shape[0] != 0:
         xmin = w - boxes[:, 2]
         xmax = w - boxes[:, 0]
-        boxes[:, 2] = xmax
-        boxes[:, 0] = xmin
+        boxes[:, 0], boxes[:, 2] = xmin, xmax
     return img, boxes
 
 
-class COCODataset(datasets.CocoDetection):
+def preprocess_img_boxes(image, boxes, input_size):
+    """Resize image + boxes with padding, keep aspect ratio. Output CHW np.array."""
+    if isinstance(input_size, (list, tuple)):
+        min_side, max_side = input_size
+    else:
+        min_side, max_side = input_size, input_size
+
+    h, w, c = image.shape
+    if h < 10 or w < 10:  # edge case: very small image
+        new_image = np.full((max_side, max_side, 3), 128, dtype=np.uint8)
+        return np.transpose(new_image, (2, 0, 1)), boxes
+
+    # Calculate scale correctly
+    scale = min(min_side / min(h, w), max_side / max(h, w))
+    nh, nw = int(h * scale), int(w * scale)
+    image_resized = cv2.resize(image, (nw, nh))
+    
+    # Create padded image
+    new_image = np.full((max_side, max_side, 3), 128, dtype=np.uint8)
+    new_image[:nh, :nw, :] = image_resized
+
+    # ... (existing code)
+    # Add debug print to check scaling
+    print(f"Original image size: ({w}, {h}), scale: {scale:.4f}")
+    print(f"Resized image size: ({nw}, {nh}), padded size: ({max_side}, {max_side})")
+    if boxes.shape[0] > 0:
+        print(f"Scaled boxes sample: {boxes[:2].tolist()}")
+
+    # Adjust boxes with the same scale
+    if boxes.shape[0] > 0:
+        boxes[:, :4] *= scale
+    return np.transpose(new_image, (2, 0, 1)), boxes
+
+
+# -----------------------------
+# Dataset
+# -----------------------------
+class COCODataset(Dataset):
     CLASSES_NAME = (
         '__back_ground__', 'person', 'bicycle', 'car', 'motorcycle',
         'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
@@ -38,7 +81,10 @@ class COCODataset(datasets.CocoDetection):
         'hair drier', 'toothbrush')
 
     def __init__(self, imgs_path, anno_path, resize_size=[800, 1333], is_train=True, transform=None):
-        super().__init__(imgs_path, anno_path)
+        super().__init__()
+        self.imgs_path = imgs_path
+        self.coco = COCO(anno_path)
+        self.ids = list(sorted(self.coco.imgs.keys()))
 
         print("INFO====>check annos, filtering invalid data......")
         ids = []
@@ -48,135 +94,102 @@ class COCODataset(datasets.CocoDetection):
             if self._has_valid_annotation(ann):
                 ids.append(id)
         self.ids = ids
-        self.category2id = {v: i + 1 for i, v in enumerate(self.coco.getCatIds())}
+
+        # Map coco category_id → contiguous id (1..num_classes-1). 0 = background
+     # replace the old mapping block
+        cat_ids = sorted(self.coco.getCatIds())            # make order deterministic
+        self.category2id = {v: i+1 for i, v in enumerate(cat_ids)}   # 0..79
         self.id2category = {v: k for k, v in self.category2id.items()}
+
 
         self.transform = transform
         self.resize_size = resize_size
-
         self.mean = [0.40789654, 0.44719302, 0.47026115]
         self.std = [0.28863828, 0.27408164, 0.27809835]
         self.train = is_train
 
-    def __getitem__(self, index):
-        img, ann = super().__getitem__(index)
+    def __len__(self):
+        return len(self.ids)
 
-        ann = [o for o in ann if o['iscrowd'] == 0]
-        boxes = [o['bbox'] for o in ann]
-        boxes = np.array(boxes, dtype=np.float32)
-        # xywh-->xyxy
-        boxes[..., 2:] = boxes[..., 2:] + boxes[..., :2]
-        if self.train:
-            if random.random() < 0.5:
-                img, boxes = flip(img, boxes)
-            if self.transform is not None:
-                img, boxes = self.transform(img, boxes)
+    def __getitem__(self, index):
+        img_id = self.ids[index]
+        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        ann = self.coco.loadAnns(ann_ids)
+
+        path = self.coco.loadImgs(img_id)[0]['file_name']
+        img = Image.open(os.path.join(self.imgs_path, path)).convert('RGB')
         img = np.array(img)
 
-        img, boxes = self.preprocess_img_boxes(img, boxes, self.resize_size)
+        ann = [o for o in ann if o['iscrowd'] == 0]
+        boxes = np.array([o['bbox'] for o in ann], dtype=np.float32).reshape(-1, 4)
+        if boxes.shape[0] > 0:
+            boxes[:, 2:] += boxes[:, :2]  # xywh -> xyxy
+            boxes[:, 2] = np.maximum(boxes[:, 2], boxes[:, 0] + 1e-5)  # xmax ≥ xmin + tiny value
+            boxes[:, 3] = np.maximum(boxes[:, 3], boxes[:, 1] + 1e-5)  # ymax ≥ ymin + tiny value
+            # Validate and filter boxes
 
-        classes = [o['category_id'] for o in ann]
-        classes = [self.category2id[c] for c in classes]
 
-        img = transforms.ToTensor()(img)
-        # Jittor doesn't have inplace normalize, but it's not a big issue here.
-        # img = transforms.Normalize(self.mean, self.std)(img) 
-        boxes = jt.array(boxes).float32()
-        classes = jt.array(classes).int64()
+        if self.train and random.random() < 0.5:
+            img, boxes = flip(Image.fromarray(img), boxes)
+            img = np.array(img)
+
+        img, boxes = preprocess_img_boxes(img, boxes, self.resize_size)
+
+        classes = [self.category2id[o['category_id']] for o in ann]
+        classes = np.array(classes, dtype=np.int64).reshape(-1)
+
+        # Convert to Jittor vars
+        classes = jt.array(classes, dtype=jt.int64) if len(classes) > 0 else jt.ones([0], dtype=jt.int64)
+        boxes = jt.array(boxes, dtype=jt.float32) if boxes.shape[0] > 0 else jt.ones([0, 4], dtype=jt.float32)
+        img = jt.array(img, dtype=jt.float32) / 255.0
+
+        # Debug check: make sure classes are in range
+        if classes.numel() > 0:
+            if classes.max().item() >= DefaultConfig.class_num or classes.min().item() < 0:
+                print("[WARNING] Bad class index found:",
+                       classes.numpy().tolist(),
+                       f"class_num={DefaultConfig.class_num}")
 
         return img, boxes, classes
-
-    def preprocess_img_boxes(self, image, boxes, input_ksize):
-        '''
-        resize image and bboxes
-        Returns
-        image_paded: input_ksize
-        bboxes: [None,4]
-        '''
-        min_side, max_side = input_ksize
-        h, w, _ = image.shape
-
-        smallest_side = min(w, h)
-        largest_side = max(w, h)
-        scale = min_side / smallest_side
-        if largest_side * scale > max_side:
-            scale = max_side / largest_side
-        nw, nh = int(scale * w), int(scale * h)
-        image_resized = cv2.resize(image, (nw, nh))
-
-        pad_w = 32 - nw % 32
-        pad_h = 32 - nh % 32
-
-        image_paded = np.zeros(shape=[nh + pad_h, nw + pad_w, 3], dtype=np.uint8)
-        image_paded[:nh, :nw, :] = image_resized
-
-        if boxes is None:
-            return image_paded
-        else:
-            boxes[:, [0, 2]] = boxes[:, [0, 2]] * scale
-            boxes[:, [1, 3]] = boxes[:, [1, 3]] * scale
-            return image_paded, boxes
 
     def _has_only_empty_bbox(self, annot):
         return all(any(o <= 1 for o in obj['bbox'][2:]) for obj in annot)
 
     def _has_valid_annotation(self, annot):
-        if len(annot) == 0:
-            return False
-
-        if self._has_only_empty_bbox(annot):
-            return False
-
+        if len(annot) == 0: return False
+        if self._has_only_empty_bbox(annot): return False
         return True
 
     def collate_fn(self, data):
         imgs_list, boxes_list, classes_list = zip(*data)
-        assert len(imgs_list) == len(boxes_list) == len(classes_list)
-        batch_size = len(boxes_list)
-        pad_imgs_list = []
-        pad_boxes_list = []
-        pad_classes_list = []
 
-        h_list = [int(s.shape[1]) for s in imgs_list]
-        w_list = [int(s.shape[2]) for s in imgs_list]
-        max_h = np.array(h_list).max()
-        max_w = np.array(w_list).max()
+        # Pad images
+        max_h = max([img.shape[1] for img in imgs_list])
+        max_w = max([img.shape[2] for img in imgs_list])
+        pad_imgs = []
+        for img in imgs_list:
+            _, h, w = img.shape
+            padded = jt.nn.pad(img, (0, max_w - w, 0, max_h - h), mode="constant", value=0.)
+            pad_imgs.append(transforms.Normalize(self.mean, self.std)(padded))
+        batch_imgs = jt.stack(pad_imgs)
 
-        # The image is already a Jittor tensor from ToTensor.
-        for i in range(batch_size):
-            img = imgs_list[i]
-            padded_img = jt.nn.pad(img, (0, int(max_w - img.shape[2]), 0, int(max_h - img.shape[1])), mode='constant', value=0.)
-            pad_imgs_list.append(transforms.Normalize(self.mean, self.std)(padded_img))
-
-        max_num = 0
-        for i in range(batch_size):
-            n = boxes_list[i].shape[0]
-            if n > max_num:
-                max_num = n
-        
-        if max_num > 0:
-            for i in range(batch_size):
-                pad_boxes_list.append(jt.nn.pad(boxes_list[i], (0, 0, 0, max_num - boxes_list[i].shape[0]), mode='constant', value=-1))
-                pad_classes_list.append(jt.nn.pad(classes_list[i], (0, max_num - classes_list[i].shape[0]), mode='constant', value=-1))
-        else:
-            # Handle the case where there are no ground truth boxes in the batch
-            pad_boxes_list = [jt.ones([1, 4]) * -1] * batch_size
-            pad_classes_list = [jt.ones([1]) * -1] * batch_size
-
-
-        batch_boxes = jt.stack(pad_boxes_list)
-        batch_classes = jt.stack(pad_classes_list)
-        batch_imgs = jt.stack(pad_imgs_list)
+        # Pad boxes and classes
+        max_num = max([b.shape[0] for b in boxes_list]) if boxes_list else 0
+        pad_boxes, pad_classes = [], []
+        for boxes, classes in zip(boxes_list, classes_list):
+            if boxes.shape[0] == 0:
+                # no gt case
+                boxes = jt.ones([1, 4]) * -1
+                classes = jt.ones([1]) * -1
+            if max_num > 0:
+                pad_boxes.append(jt.nn.pad(boxes, (0, 0, 0, max_num - boxes.shape[0]),
+                                           mode="constant", value=-1))
+                pad_classes.append(jt.nn.pad(classes, (0, max_num - classes.shape[0]),
+                                             mode="constant", value=-1))
+            else:
+                pad_boxes.append(boxes)
+                pad_classes.append(classes)
+        batch_boxes = jt.stack(pad_boxes)
+        batch_classes = jt.stack(pad_classes)
 
         return batch_imgs, batch_boxes, batch_classes
-
-
-if __name__ == "__main__":
-    # Example usage with Jittor. Replace paths with your own.
-    # Make sure to install Jittor and pycocotools
-    
-    # Jittor's CocoDetection requires the data to be downloaded first.
-    # dataset = COCODataset("/path/to/your/coco/images", "/path/to/your/coco/annotations/instances.json")
-    # img, boxes, classes = dataset.collate_fn([dataset[0], dataset[1], dataset[2]])
-    # print(boxes, classes, "\n", img.shape, boxes.shape, classes.shape, boxes.dtype, classes.dtype, img.dtype)
-    pass
