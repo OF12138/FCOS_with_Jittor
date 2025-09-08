@@ -5,10 +5,13 @@ from jittor import transform as transforms
 import numpy as np
 from dataset.dataset import COCODataset
 import time
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 from matplotlib.ticker import NullLocator
 import os
+
 
 def preprocess_img(image, input_ksize):
     '''
@@ -52,7 +55,7 @@ if __name__ == "__main__":
         use_p5 = True
 
         # head
-        class_num = 80
+        class_num = 81
         use_GN_head = True
         prior = 0.01
         add_centerness = True
@@ -90,7 +93,8 @@ if __name__ == "__main__":
         
         # Convert to Jittor tensor
         img_tensor = transforms.ToTensor()(img)
-        img_tensor = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(img_tensor)
+        img_tensor = img_tensor.transpose(2, 0, 1)
+        img_tensor = jt.array(transforms.ImageNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(img_tensor))
         
         # Add batch dimension
         img_tensor = img_tensor.unsqueeze(dim=0)
