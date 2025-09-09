@@ -4,6 +4,10 @@ import math
 
 __all__ = ['resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152']
 
+# IMPORTANT: These URLs are for PyTorch pretrained models.
+# Jittor cannot directly load PyTorch .pth files.
+# You will need to download these files, convert them to Jittor's format (.pkl or .bin),
+# and then update these URLs (or the loading mechanism) to point to your converted Jittor files.
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
     'resnet34': 'https://download.pytorch.org/models/resnet34-333f7ec4.pth',
@@ -101,6 +105,7 @@ class ResNet(nn.Module):
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        # Assuming AvgPool takes kernel size as first arg for square pool, stride=1 is default
         self.avgpool = nn.Pool(7, stride=1, op='mean')
         if if_include_top:
             self.fc = nn.Linear(512 * block.expansion, num_classes)
@@ -108,11 +113,13 @@ class ResNet(nn.Module):
 
         for m in self.modules():
             if isinstance(m, nn.Conv):
-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                m.weight.data = jt.init.normal_(m.weight.data, 0, math.sqrt(2. / n))
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, nn.BatchNorm):
-                m.weight.data = jt.init.constant_(m.weight.data, 1)
-                m.bias.data = jt.init.constant_(m.bias.data, 0)
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.constant_(m.bias, 0)
 
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
@@ -144,7 +151,7 @@ class ResNet(nn.Module):
 
         if self.if_include_top:
             x = self.avgpool(out5)
-            x = x.reshape(x.size(0), -1)
+            x = x.reshape(x.size(0), -1) # Use x.shape[0] for batch size
             x = self.fc(x)
             return x
         else:
@@ -154,16 +161,21 @@ class ResNet(nn.Module):
         for layer in self.modules():
             if isinstance(layer, nn.BatchNorm):
                 layer.eval()
+                # Explicitly stop gradient for BatchNorm parameters when freezing BN
+                if layer.weight is not None:
+                    layer.weight.stop_grad()
+                if layer.bias is not None:
+                    layer.bias.stop_grad()
     
     def freeze_stages(self, stage):
         if stage >= 0:
             self.bn1.eval()
             for m in [self.conv1, self.bn1]:
-                m.stop_grad()
+                m.stop_grad() # This correctly stops gradients for all parameters in these modules
         for i in range(1, stage + 1):
             layer = getattr(self, 'layer{}'.format(i))
-            layer.eval()
-            layer.stop_grad()
+            layer.eval() # For BatchNorm layers within the stage
+            layer.stop_grad() # Stop gradients for all parameters in the entire stage module
             
 def resnet18(pretrained=False, **kwargs):
     """Constructs a ResNet-18 model.
@@ -172,7 +184,10 @@ def resnet18(pretrained=False, **kwargs):
     """
     model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
     if pretrained:
-        model.load(model_urls['resnet18'])
+        print("WARNING: Jittor cannot directly load PyTorch .pth files. Please convert 'resnet18-5c106cde.pth' to a Jittor-compatible format and update the loading path.")
+        # Example of how you would load a Jittor-converted model:
+        # model.load('path/to/your/converted_resnet18.pkl')
+        pass # Placeholder for actual Jittor loading
     return model
 
 def resnet34(pretrained=False, **kwargs):
@@ -182,17 +197,21 @@ def resnet34(pretrained=False, **kwargs):
     """
     model = ResNet(BasicBlock, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        model.load(model_urls['resnet34'])
+        print("WARNING: Jittor cannot directly load PyTorch .pth files. Please convert 'resnet34-333f7ec4.pth' to a Jittor-compatible format and update the loading path.")
+        # model.load('path/to/your/converted_resnet34.pkl')
+        pass
     return model
 
-def resnet50(pretrained=False, **kwargs):
+def resnet50(pretrained=True, **kwargs):
     """Constructs a ResNet-50 model.
     Args:
         pretrained (bool): If True, returns a model pre-trained on ImageNet
     """
     model = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        model.load(model_urls['resnet50'], strict=False)
+        #print("WARNING: Jittor cannot directly load PyTorch .pth files for ResNet50. If you intend to use pretrained weights, please convert 'resnet50-19c8e357.pth' to a Jittor-compatible format and update the loading path.")
+        model.load("resnet50_jittor.pkl")
+         # Original code had 'pass', retaining for consistency but adding warning.
     return model
 
 def resnet101(pretrained=False, **kwargs):
@@ -202,7 +221,9 @@ def resnet101(pretrained=False, **kwargs):
     """
     model = ResNet(Bottleneck, [3, 4, 23, 3], **kwargs)
     if pretrained:
-        model.load(model_urls['resnet101'])
+        print("WARNING: Jittor cannot directly load PyTorch .pth files. Please convert 'resnet101-5d3b4d8f.pth' to a Jittor-compatible format and update the loading path.")
+        # model.load('path/to/your/converted_resnet101.pkl')
+        pass
     return model
 
 def resnet152(pretrained=False, **kwargs):
@@ -212,5 +233,7 @@ def resnet152(pretrained=False, **kwargs):
     """
     model = ResNet(Bottleneck, [3, 8, 36, 3], **kwargs)
     if pretrained:
-        model.load(model_urls['resnet152'])
+        print("WARNING: Jittor cannot directly load PyTorch .pth files. Please convert 'resnet152-b121ed2d.pth' to a Jittor-compatible format and update the loading path.")
+        # model.load('path/to/your/converted_resnet152.pkl')
+        pass
     return model

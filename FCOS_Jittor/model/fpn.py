@@ -1,6 +1,6 @@
 import jittor as jt
 import jittor.nn as nn
-import jittor.nn.functional as F
+from jittor import nn as F
 import math
 
 class FPN(nn.Module):

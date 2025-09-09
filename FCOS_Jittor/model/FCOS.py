@@ -1,5 +1,6 @@
 import jittor as jt
 import jittor.nn as nn
+
 from .head import ClsCntRegHead
 from .fpn import FPN
 from .resnet import resnet50
@@ -55,17 +56,22 @@ class DetectHead(nn.Module):
             self.config = config
 
     def execute(self, inputs):
-        cls_logits, coords = self._reshape_cat_out(inputs[0], self.strides)
-        cnt_logits, _ = self._reshape_cat_out(inputs[1], self.strides)
-        reg_preds, _ = self._reshape_cat_out(inputs[2], self.strides)
+        # Unpack the lists of feature maps from the FCOS head
+        cls_logits_list, cnt_logits_list, reg_preds_list = inputs
 
+        # This logic ensures coordinates are generated from the SAME source
+        # as the regression predictions, which is the correct workaround.
+        reg_preds, coords = self._reshape_cat_out(reg_preds_list, self.strides)
+        cls_logits, _ = self._reshape_cat_out(cls_logits_list, self.strides)
+        cnt_logits, _ = self._reshape_cat_out(cnt_logits_list, self.strides)
+
+        # --- The rest of the function proceeds as normal ---
         cls_preds = cls_logits.sigmoid()
         cnt_preds = cnt_logits.sigmoid()
-        
-        # Jittor tensors are on the GPU automatically if a GPU is available, so the check is not needed.
-        # coords = coords.cuda() if torch.cuda.is_available() else coords
 
-        cls_scores, cls_classes = jt.max(cls_preds, dim=-1)
+        # In model/FCOS.py
+        cls_scores = jt.max(cls_preds, dim=-1)
+        cls_classes = jt.argmax(cls_preds, dim=-1)[0]
 
         if self.config.add_centerness:
             cls_scores = jt.sqrt(cls_scores * (cnt_preds.squeeze(dim=-1)))
@@ -124,7 +130,10 @@ class DetectHead(nn.Module):
         assert boxes.shape[-1] == 4
         x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
         areas = (x2 - x1 + 1) * (y2 - y1 + 1)
-        order = jt.argsort(scores, descending=True)
+        
+        sort_result = jt.argsort(scores, descending=True)
+        order = sort_result[1] if isinstance(sort_result, tuple) else sort_result
+        
         keep = []
         
         while order.numel() > 0:
@@ -144,16 +153,21 @@ class DetectHead(nn.Module):
             inter = (xmax - xmin).clamp(min_v=0) * (ymax - ymin).clamp(min_v=0)
             iou = inter / (areas[i] + areas[order[1:]] - inter)
             
-            idx = (iou <= thr).nonzero().squeeze()
-            if idx.numel() == 0:
+            # --- START OF FIX ---
+            # 1. Get indices from .nonzero() without squeezing immediately.
+            nonzero_idx = (iou <= thr).nonzero()
+
+            # 2. Check if the result is empty BEFORE squeezing.
+            if nonzero_idx.numel() == 0:
                 break
             
-            # The indexing is different in Jittor; jt.array() is used to create a new tensor
-            # The next 'order' are the remaining indices.
-            if idx.ndim == 0:
-                order = order[idx + 1].unsqueeze(0)
-            else:
-                order = order[idx + 1]
+            # 3. Now it's safe to squeeze. Use squeeze(1) to ensure it's always a 1D tensor.
+            #    This also simplifies the logic below.
+            idx = nonzero_idx.squeeze(1)
+
+            # 4. Update order. The previous check for idx.ndim is no longer needed.
+            order = order[idx + 1]
+            # --- END OF FIX ---
 
         return jt.array(keep, dtype=jt.int64)
 
@@ -162,13 +176,13 @@ class DetectHead(nn.Module):
             return jt.empty(shape=(0,), dtype=jt.int64)
 
         max_coordinate = jt.max(boxes)
-        # Jittor needs explicit casting for operations
         offsets = idxs.float32() * (max_coordinate + 1)
         boxes_for_nms = boxes + offsets.unsqueeze(1)
         keep = self.box_nms(boxes_for_nms, scores, iou_threshold)
         return keep
 
     def _coords2boxes(self, coords, offsets):
+        # unsqueeze coords to add a batch dimension for broadcasting
         x1y1 = coords.unsqueeze(0) - offsets[..., :2]
         x2y2 = coords.unsqueeze(0) + offsets[..., 2:]
         boxes = jt.concat([x1y1, x2y2], dim=-1)
@@ -180,9 +194,13 @@ class DetectHead(nn.Module):
         out = []
         coords = []
         for pred, stride in zip(inputs, strides):
-            pred = pred.permute(0, 2, 3, 1)
+            # FIX: Generate coordinates from the original [B, C, H, W] shape FIRST.
             coord = coords_fmap2orig(pred, stride)
+            
+            # THEN, permute and reshape the prediction tensor for concatenation.
+            pred = pred.permute(0, 2, 3, 1)
             pred = jt.reshape(pred, [batch_size, -1, c])
+            
             out.append(pred)
             coords.append(coord)
         return jt.concat(out, dim=1), jt.concat(coords, dim=0)
@@ -218,9 +236,9 @@ class FCOSDetector(nn.Module):
 
     def execute(self, inputs):
         if self.mode == "training":
-            batch_imgs, batch_boxes, batch_classes = inputs
+            batch_imgs, batch_boxes, batch_classes, batch_scales = inputs
             out = self.fcos_body(batch_imgs)
-            targets = self.target_layer([out, batch_boxes, batch_classes])
+            targets = self.target_layer([out, batch_boxes, batch_classes,batch_scales])
             losses = self.loss_layer([out, targets])
             return losses
         elif self.mode == "inference":

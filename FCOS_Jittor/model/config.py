@@ -1,6 +1,6 @@
 class DefaultConfig():
     #backbone
-    pretrained=True
+    pretrained=True 
     freeze_stage_1=True
     freeze_bn=True
 
@@ -9,7 +9,7 @@ class DefaultConfig():
     use_p5=True
     
     #head
-    class_num=80
+    class_num=81
     use_GN_head=True
     prior=0.01
     add_centerness=True
@@ -18,6 +18,7 @@ class DefaultConfig():
     #training
     strides=[8,16,32,64,128]
     limit_range=[[-1,64],[64,128],[128,256],[256,512],[512,999999]]
+    add_centerness=True
 
     #inference
     score_threshold=0.05

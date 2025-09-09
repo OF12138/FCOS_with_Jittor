@@ -55,7 +55,7 @@ def preprocess_img_boxes(image, boxes, input_size):
     # Adjust boxes with the same scale
     if boxes.shape[0] > 0:
         boxes[:, :4] *= scale
-    return np.transpose(new_image, (2, 0, 1)), boxes
+    return np.transpose(new_image, (2, 0, 1)), boxes ,scale
 
 
 # -----------------------------
@@ -96,7 +96,7 @@ class COCODataset(Dataset):
         self.ids = ids
 
         # Map coco category_id → contiguous id (1..num_classes-1). 0 = background
-     # replace the old mapping block
+        # replace the old mapping block
         cat_ids = sorted(self.coco.getCatIds())            # make order deterministic
         self.category2id = {v: i+1 for i, v in enumerate(cat_ids)}   # 0..79
         self.id2category = {v: k for k, v in self.category2id.items()}
@@ -133,7 +133,7 @@ class COCODataset(Dataset):
             img, boxes = flip(Image.fromarray(img), boxes)
             img = np.array(img)
 
-        img, boxes = preprocess_img_boxes(img, boxes, self.resize_size)
+        img, boxes , scale  = preprocess_img_boxes(img, boxes, self.resize_size)
 
         classes = [self.category2id[o['category_id']] for o in ann]
         classes = np.array(classes, dtype=np.int64).reshape(-1)
@@ -150,7 +150,7 @@ class COCODataset(Dataset):
                        classes.numpy().tolist(),
                        f"class_num={DefaultConfig.class_num}")
 
-        return img, boxes, classes
+        return img, boxes, classes ,scale
 
     def _has_only_empty_bbox(self, annot):
         return all(any(o <= 1 for o in obj['bbox'][2:]) for obj in annot)
@@ -161,7 +161,7 @@ class COCODataset(Dataset):
         return True
 
     def collate_fn(self, data):
-        imgs_list, boxes_list, classes_list = zip(*data)
+        imgs_list, boxes_list, classes_list ,scale_list = zip(*data)
 
         # Pad images
         max_h = max([img.shape[1] for img in imgs_list])
@@ -191,5 +191,6 @@ class COCODataset(Dataset):
                 pad_classes.append(classes)
         batch_boxes = jt.stack(pad_boxes)
         batch_classes = jt.stack(pad_classes)
-
-        return batch_imgs, batch_boxes, batch_classes
+        batch_scales = jt.array(scale_list, dtype=jt.float32).unsqueeze(-1).unsqueeze(-1)  # [B,1,1]
+        
+        return batch_imgs, batch_boxes, batch_classes, batch_scales

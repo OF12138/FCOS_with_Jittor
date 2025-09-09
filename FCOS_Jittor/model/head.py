@@ -1,5 +1,6 @@
 import jittor.nn as nn
 import jittor as jt
+from jittor.nn import init
 import math
 
 class ScaleExp(nn.Module):
@@ -49,11 +50,12 @@ class ClsCntRegHead(nn.Module):
         jt.init.constant_(self.cls_logits.bias, -math.log((1 - prior) / prior))
         self.scale_exp = nn.ModuleList([ScaleExp(1.0) for _ in range(5)])
     
-    def init_conv_RandomNormal(self,module,std=0.01):
+    def init_conv_RandomNormal(self, module):
         if isinstance(module, nn.Conv):
-            jt.init.normal_(module.weight, std=std)
+            # Using init.gauss_ instead of init.normal_ which is not a top-level function.
+            init.gauss_(module.weight, std=0.01)
             if module.bias is not None:
-                jt.init.constant_(module.bias, 0)
+                nn.init.constant_(module.bias, 0)
     
     def execute(self,inputs):
         '''inputs:[P3~P7]'''
@@ -61,8 +63,20 @@ class ClsCntRegHead(nn.Module):
         cnt_logits=[]
         reg_preds=[]
         for index,P in enumerate(inputs):
+
+            # --- ADD THIS DEBUGGING BLOCK ---
+            #print(f"\n--- DEBUG: Inside Head, FPN Level {index+3} ---")
+            #print(f"  Input P shape: {P.shape}")
+            # --- END OF DEBUGGING BLOCK ---
+
             cls_conv_out=self.cls_conv(P)
             reg_conv_out=self.reg_conv(P)
+
+
+            # --- ADD THIS DEBUGGING BLOCK ---
+            #print(f"  cls_conv_out shape: {cls_conv_out.shape}")
+            #print(f"  reg_conv_out shape: {reg_conv_out.shape}")
+            # --- END OF DEBUGGING BLOCK ---
 
             cls_logits.append(self.cls_logits(cls_conv_out))
             if not self.cnt_on_reg:
