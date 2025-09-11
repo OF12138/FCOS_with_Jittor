@@ -73,7 +73,7 @@ if __name__ == "__main__":
     model = FCOSDetector(mode="inference", config=Config)
     
     # Load state dict
-    state_dict = jt.load("./checkpoint/model_1.pth")
+    state_dict = jt.load("./checkpoint/model_10.pth")
     model.load_state_dict(state_dict)
     
     # Set to evaluation mode

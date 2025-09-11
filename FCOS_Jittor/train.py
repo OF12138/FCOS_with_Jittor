@@ -9,9 +9,11 @@ import numpy as np
 import random
 import argparse
 from jittor import nn
+#from torch.utils.tensorboard import SummaryWriter
+
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--epochs", type=int, default=1, help="number of epochs")
+parser.add_argument("--epochs", type=int, default=10, help="number of epochs")
 parser.add_argument("--batch_size", type=int, default=1, help="size of each image batch")
 parser.add_argument("--n_cpu", type=int, default=0, help="number of cpu threads to use during batch generation")
 parser.add_argument("--n_gpu", type=str, default='0', help="not used in jittor, set via jt.flags.use_cuda")
@@ -20,7 +22,7 @@ opt = parser.parse_args()
 # Jittor handles device placement automatically. Setting flags is the preferred way.
 # os.environ["CUDA_VISIBLE_DEVICES"] is not necessary as Jittor manages this internally.
 #if 'CUDA_VISIBLE_DEVICES' in os.environ:
-   # os.environ['CUDA_VISIBLE_DEVICES'] = opt.n_gpu
+# os.environ['CUDA_VISIBLE_DEVICES'] = opt.n_gpu
 jt.flags.use_cuda = 1
 
 # Setting seeds for reproducibility in Jittor
@@ -33,15 +35,16 @@ transform = Transforms()
 train_dataset = COCODataset("./dataset/tiny_coco/images/train2017",
                             './dataset/tiny_coco/annotations/instances_train2017.json',
                             transform=transform,
-                          )
+                        )
 # set the dataloader
 train_loader = DataLoader(train_dataset,
-                          batch_size=opt.batch_size,
-                          shuffle=True,
-                          collate_fn=train_dataset.collate_fn,
-                          num_workers=opt.n_cpu,
-                          )
+                        batch_size=opt.batch_size,
+                        shuffle=True,
+                        collate_fn=train_dataset.collate_fn,
+                        num_workers=opt.n_cpu,
+                        )
 
+#writer=SummaryWriter('logs/FCOS_experiment_1')
 model = FCOSDetector(mode="training")
 # Jittor's DataParallel is not explicitly needed as it handles this automatically.
 # model = jt.nn.DataParallel(model) 
@@ -57,10 +60,10 @@ GLOBAL_STEPS = 0
 LR_INIT = 0.01
 
 optimizer = jt.optim.SGD(model.parameters(),
-                         lr=LR_INIT,
-                         momentum=0.9,
-                         weight_decay=0.0001,
-                         )
+                        lr=LR_INIT,
+                        momentum=0.9,
+                        weight_decay=0.0001,
+                        )
 
 # set the learning rate scheduler
 lr_schedule = [120000, 160000]
@@ -84,7 +87,7 @@ model.train()
 for epoch in range(EPOCHS):
     for epoch_step, data in enumerate(train_loader):
         # Data is already on the correct device with Jittor, no need for .cuda()
-        batch_imgs, batch_boxes, batch_classes = data
+        batch_imgs, batch_boxes, batch_classes ,batch_scales = data
         #print("batch_imgs.shape before model:", batch_imgs.shape)
         #print(batch_imgs.dtype)
 
@@ -104,7 +107,7 @@ for epoch in range(EPOCHS):
 
         
         # Jittor's `execute()` method is called implicitly when the module is called.
-        losses = model([batch_imgs, batch_boxes, batch_classes])
+        losses = model([batch_imgs, batch_boxes, batch_classes, batch_scales])
         loss = losses[-1]
 
         # Extract individual losses (ensure these indices match your model's output)
@@ -112,6 +115,12 @@ for epoch in range(EPOCHS):
         cnt_loss = losses[1].mean()
         reg_loss = losses[2].mean()
         total_loss = losses[-1].mean()  # Total loss
+
+        #writer.add_scalar('Loss/Total', total_loss, GLOBAL_STEPS)
+        #writer.add_scalar('Loss/Classification', cls_loss, GLOBAL_STEPS)
+        #writer.add_scalar('Loss/Regression', reg_loss, GLOBAL_STEPS)
+        #writer.add_scalar('Loss/Centerness', cnt_loss, GLOBAL_STEPS)
+        #writer.add_scalar('LearningRate', lr, GLOBAL_STEPS)
         
         # Check if current step has meaningful loss
         if cls_loss.item() > 0 or cnt_loss.item() > 0 or reg_loss.item() > 0:
@@ -137,7 +146,7 @@ for epoch in range(EPOCHS):
         cost_time = int((end_time - start_time) * 1000)
 
         print("global_steps:%d epoch:%d steps:%d/%d cls_loss:%.4f cnt_loss:%.4f reg_loss:%.4f cost_time:%dms lr=%.4e total_loss:%.4f" %
-              (GLOBAL_STEPS, epoch + 1, epoch_step + 1, steps_per_epoch, losses[0].mean().item(), losses[1].mean().item(), losses[2].mean().item(), cost_time, lr, loss.mean().item()))
+            (GLOBAL_STEPS, epoch + 1, epoch_step + 1, steps_per_epoch, losses[0].mean().item(), losses[1].mean().item(), losses[2].mean().item(), cost_time, lr, loss.mean().item()))
 
         GLOBAL_STEPS += 1
     
