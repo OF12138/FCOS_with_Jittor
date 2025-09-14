@@ -8,6 +8,7 @@ The project provide two versions of FCOS implementation.<br>
 -CUDA: 12.1<br>
 -Jittor: 1.3.9.14<br>
 -GCC: 11.5.0<br>
+-Pytorch: ??<br>
 ### Pytorch version<br>
 -Pytorch: 2.4.1<br>
 -Others: the same with jittor environment<br>

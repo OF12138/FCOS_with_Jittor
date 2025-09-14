@@ -1,266 +1,322 @@
-#
-# loss.py (PyTorch Version)
-# This file uses the PyTorch framework for all loss-related calculations.
-# It includes helper functions to convert Jittor tensors to PyTorch tensors at the beginning
-# of the computation and convert the final PyTorch loss tensor back to a Jittor tensor at the end.
-# This allows it to function as a drop-in replacement in your Jittor project.
-#
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import jittor as jt # Jittor is imported ONLY for the final conversion back.
 from .config import DefaultConfig
 
-def coords_fmap2orig(feature, stride):
-    """
-    Convert feature map coordinates to image coordinates (Jittor version).
-    This function is used by DetectHead in FCOS.py during inference.
-    """
-    h, w = feature.shape[-2:]
-    shifts_x = jt.arange(0, w, dtype=jt.float32) + 0.5
-    shifts_y = jt.arange(0, h, dtype=jt.float32) + 0.5
-    shifts_x = shifts_x * stride
-    shifts_y = shifts_y * stride
-    shift_y, shift_x = jt.meshgrid(shifts_y, shifts_x)
-    shift_x = shift_x.reshape([-1])
-    shift_y = shift_y.reshape([-1])
-    coords = jt.stack([shift_x, shift_y], dim=-1)
+
+def coords_fmap2orig(feature,stride):
+    '''
+    transfor one fmap coords to orig coords
+    Args
+    featurn [batch_size,h,w,c]
+    stride int
+    Returns 
+    coords [n,2]
+    '''
+    h,w=feature.shape[1:3]
+    shifts_x = torch.arange(0, w * stride, stride, dtype=torch.float32)
+    shifts_y = torch.arange(0, h * stride, stride, dtype=torch.float32)
+
+    shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x)
+    shift_x = torch.reshape(shift_x, [-1])
+    shift_y = torch.reshape(shift_y, [-1])
+    coords = torch.stack([shift_x, shift_y], -1) + stride // 2
     return coords
 
-# -------------------- Jittor <--> PyTorch Conversion Helpers --------------------
-
-def jittor_to_torch(jittor_var):
-    """Recursively converts a Jittor Var or a list of Jittor Vars to PyTorch Tensors."""
-    if jittor_var is None:
-        return None
-    if isinstance(jittor_var, list):
-        return [jittor_to_torch(v) for v in jittor_var]
-    
-    # Convert Jittor Var to numpy array, then to PyTorch tensor.
-    # Assumes CUDA is used, as per your train.py (jt.flags.use_cuda=1)
-    return torch.from_numpy(jittor_var.numpy()).cuda()
-
-def torch_to_jittor(torch_tensor):
-    """Converts a PyTorch Tensor back to a Jittor Var."""
-    # Convert PyTorch tensor to numpy array (after moving to CPU), then to Jittor Var.
-    return jt.array(torch_tensor.detach().cpu().numpy())
-
-# -------------------- Target generation (PyTorch) --------------------
 class GenTargets(nn.Module):
-    def __init__(self, strides, limit_range):
+    def __init__(self,strides,limit_range):
         super().__init__()
-        self.strides = strides
-        self.limit_range = limit_range
-        assert len(self.strides) == len(self.limit_range)
+        self.strides=strides
+        self.limit_range=limit_range
+        assert len(strides)==len(limit_range)
 
-    def forward(self, inputs): # RENAMED from execute to forward
-        # 1. CONVERT JITTOR INPUTS TO PYTORCH
-        cls_logits, cnt_logits, reg_preds = jittor_to_torch(inputs[0])
-        gt_boxes, classes, batch_scales = jittor_to_torch(inputs[1]), jittor_to_torch(inputs[2]), jittor_to_torch(inputs[3])
-        
-        # --- All internal calculations are now in PyTorch ---
-        cls_targets_all, cnt_targets_all, reg_targets_all = [], [], []
-
-        for lvl, stride in enumerate(self.strides):
-            # Pass feature map from current level for shape info
-            cls_t, cnt_t, reg_t = self._gen_level_targets(
-                cls_logits[lvl], gt_boxes, classes,
-                stride, self.limit_range[lvl]
-            )
-            cls_targets_all.append(cls_t)
-            cnt_targets_all.append(cnt_t)
-            reg_targets_all.append(reg_t)
-
-        # 2. CONVERT PYTORCH RESULTS BACK TO JITTOR
-        cls_targets_final = torch_to_jittor(torch.cat(cls_targets_all, dim=1))
-        cnt_targets_final = torch_to_jittor(torch.cat(cnt_targets_all, dim=1))
-        reg_targets_final = torch_to_jittor(torch.cat(reg_targets_all, dim=1))
-
-        return [cls_targets_final, cnt_targets_final, reg_targets_final]
-
-    def _gen_level_targets(self, feature_map, gt_boxes, classes, stride, limit_range, sample_radius_ratio=1.5):
-        B, _, H, W = feature_map.shape
-        HW = H * W
-        min_range, max_range = float(limit_range[0]), float(limit_range[1])
-
-        shifts_x = torch.arange(0, W * stride, stride, dtype=torch.float32, device=feature_map.device) + stride / 2.0
-        shifts_y = torch.arange(0, H * stride, stride, dtype=torch.float32, device=feature_map.device) + stride / 2.0
-        # Use 'xy' indexing for clarity, matching standard convention
-        shift_x, shift_y = torch.meshgrid(shifts_x, shifts_y, indexing='xy')
-        coords_original = torch.stack([shift_x.reshape(-1), shift_y.reshape(-1)], dim=-1)
-
-        cls_list, cnt_list, reg_list = [], [], []
-        INF = 1e10
-
-        for b in range(B):
-            boxes_b, cls_b = gt_boxes[b], classes[b]
-            valid_mask = (cls_b >= 0)
+    def forward(self,inputs):
+        '''
+        inputs  
+        [0]list [cls_logits,cnt_logits,reg_preds]  
+        cls_logits  list contains five [batch_size,class_num,h,w]  
+        cnt_logits  list contains five [batch_size,1,h,w]  
+        reg_preds   list contains five [batch_size,4,h,w]  
+        [1]gt_boxes [batch_size,m,4]  FloatTensor  
+        [2]classes [batch_size,m]  LongTensor
+        Returns
+        cls_targets:[batch_size,sum(_h*_w),1]
+        cnt_targets:[batch_size,sum(_h*_w),1]
+        reg_targets:[batch_size,sum(_h*_w),4]
+        '''
+        cls_logits,cnt_logits,reg_preds=inputs[0]
+        gt_boxes=inputs[1]
+        classes=inputs[2]
+        cls_targets_all_level=[]
+        cnt_targets_all_level=[]
+        reg_targets_all_level=[]
+        assert len(self.strides)==len(cls_logits)
+        for level in range(len(cls_logits)):
+            level_out=[cls_logits[level],cnt_logits[level],reg_preds[level]]
+            level_targets=self._gen_level_targets(level_out,gt_boxes,classes,self.strides[level],
+                                                    self.limit_range[level])
+            cls_targets_all_level.append(level_targets[0])
+            cnt_targets_all_level.append(level_targets[1])
+            reg_targets_all_level.append(level_targets[2])
             
-            boxes_valid = boxes_b[valid_mask]
-            cls_valid = cls_b[valid_mask].long()
-            m = boxes_valid.shape[0]
+        return torch.cat(cls_targets_all_level,dim=1),torch.cat(cnt_targets_all_level,dim=1),torch.cat(reg_targets_all_level,dim=1)
 
-            if m == 0:
-                cls_list.append(torch.zeros((HW, 1), dtype=torch.int64, device=feature_map.device))
-                cnt_list.append(torch.full((HW, 1), -1.0, dtype=torch.float32, device=feature_map.device))
-                reg_list.append(torch.full((HW, 4), -1.0, dtype=torch.float32, device=feature_map.device))
-                continue
+    def _gen_level_targets(self,out,gt_boxes,classes,stride,limit_range,sample_radiu_ratio=1.5):
+        '''
+        Args  
+        out list contains [[batch_size,class_num,h,w],[batch_size,1,h,w],[batch_size,4,h,w]]  
+        gt_boxes [batch_size,m,4]  
+        classes [batch_size,m]  
+        stride int  
+        limit_range list [min,max]  
+        Returns  
+        cls_targets,cnt_targets,reg_targets
+        '''
+        cls_logits,cnt_logits,reg_preds=out
+        batch_size=cls_logits.shape[0]
+        class_num=cls_logits.shape[1]
+        m=gt_boxes.shape[1]
 
-            coords_b = coords_original
-            coords_exp = coords_b.unsqueeze(1).repeat(1, m, 1)
-            boxes_exp = boxes_valid.unsqueeze(0).repeat(HW, 1, 1)
+        cls_logits=cls_logits.permute(0,2,3,1) #[batch_size,h,w,class_num]  
+        coords=coords_fmap2orig(cls_logits,stride).to(device=gt_boxes.device)#[h*w,2]
 
-            x, y = coords_exp[..., 0], coords_exp[..., 1]
-            l = x - boxes_exp[..., 0]
-            t = y - boxes_exp[..., 1]
-            r = boxes_exp[..., 2] - x
-            b_ = boxes_exp[..., 3] - y
-            ltrb = torch.stack([l, t, r, b_], dim=-1)
+        cls_logits=cls_logits.reshape((batch_size,-1,class_num))#[batch_size,h*w,class_num]  
+        cnt_logits=cnt_logits.permute(0,2,3,1)
+        cnt_logits=cnt_logits.reshape((batch_size,-1,1))
+        reg_preds=reg_preds.permute(0,2,3,1)
+        reg_preds=reg_preds.reshape((batch_size,-1,4))
 
-            off_min = torch.min(ltrb, dim=-1).values
-            off_max = torch.max(ltrb, dim=-1).values
-            mask_in_box = off_min >= 0
-            mask_in_level = (off_max >= min_range) & (off_max <= max_range)
+        h_mul_w=cls_logits.shape[1]
 
-            cx = (boxes_valid[:, 0] + boxes_valid[:, 2]) / 2.0
-            cy = (boxes_valid[:, 1] + boxes_valid[:, 3]) / 2.0
-            c_l = x - cx.unsqueeze(0)
-            c_t = y - cy.unsqueeze(0)
-            c_r = cx.unsqueeze(0) - x
-            c_b = cy.unsqueeze(0) - y
-            c_off_max = torch.max(torch.stack([c_l, c_t, c_r, c_b], dim=-1), dim=-1).values
-            radius = stride * sample_radius_ratio
-            mask_center = c_off_max < radius
+        x=coords[:,0]
+        y=coords[:,1]
+        l_off=x[None,:,None]-gt_boxes[...,0][:,None,:]#[1,h*w,1]-[batch_size,1,m]-->[batch_size,h*w,m]
+        t_off=y[None,:,None]-gt_boxes[...,1][:,None,:]
+        r_off=gt_boxes[...,2][:,None,:]-x[None,:,None]
+        b_off=gt_boxes[...,3][:,None,:]-y[None,:,None]
+        ltrb_off=torch.stack([l_off,t_off,r_off,b_off],dim=-1)#[batch_size,h*w,m,4]
 
-            pos_mask = mask_in_box & mask_in_level & mask_center
+        areas=(ltrb_off[...,0]+ltrb_off[...,2])*(ltrb_off[...,1]+ltrb_off[...,3])#[batch_size,h*w,m]
 
-            areas = (boxes_valid[:, 2] - boxes_valid[:, 0]) * (boxes_valid[:, 3] - boxes_valid[:, 1])
-            areas_exp = areas.unsqueeze(0).repeat(HW, 1)
-            areas_valid = torch.where(pos_mask, areas_exp, torch.full_like(areas_exp, INF))
+        off_min=torch.min(ltrb_off,dim=-1)[0]#[batch_size,h*w,m]
+        off_max=torch.max(ltrb_off,dim=-1)[0]#[batch_size,h*w,m]
 
-            min_inds = torch.argmin(areas_valid, dim=1)
-            min_vals = areas_valid.gather(1, min_inds.unsqueeze(1)).squeeze(1)
+        mask_in_gtboxes=off_min>0
+        mask_in_level=(off_max>limit_range[0])&(off_max<=limit_range[1])
 
-            cls_target = torch.zeros((HW, 1), dtype=torch.int64, device=feature_map.device)
-            cnt_target = torch.full((HW, 1), -1.0, dtype=torch.float32, device=feature_map.device)
-            reg_target = torch.full((HW, 4), -1.0, dtype=torch.float32, device=feature_map.device)
+        radiu=stride*sample_radiu_ratio
+        gt_center_x=(gt_boxes[...,0]+gt_boxes[...,2])/2
+        gt_center_y=(gt_boxes[...,1]+gt_boxes[...,3])/2
+        c_l_off=x[None,:,None]-gt_center_x[:,None,:]#[1,h*w,1]-[batch_size,1,m]-->[batch_size,h*w,m]
+        c_t_off=y[None,:,None]-gt_center_y[:,None,:]
+        c_r_off=gt_center_x[:,None,:]-x[None,:,None]
+        c_b_off=gt_center_y[:,None,:]-y[None,:,None]
+        c_ltrb_off=torch.stack([c_l_off,c_t_off,c_r_off,c_b_off],dim=-1)#[batch_size,h*w,m,4]
+        c_off_max=torch.max(c_ltrb_off,dim=-1)[0]
+        mask_center=c_off_max<radiu
 
-            pos_loc_mask = min_vals < INF
-            
-            if pos_loc_mask.sum() > 0:
-                pos_indices = torch.where(pos_loc_mask)[0]
-                min_inds_pos = min_inds[pos_indices]
+        mask_pos=mask_in_gtboxes&mask_in_level&mask_center#[batch_size,h*w,m]
 
-                reg_selected = ltrb[pos_indices, min_inds_pos]
-                cls_selected = cls_valid[min_inds_pos]
+        areas[~mask_pos]=99999999
+        areas_min_ind=torch.min(areas,dim=-1)[1]#[batch_size,h*w]
+        reg_targets=ltrb_off[torch.zeros_like(areas,dtype=torch.bool).scatter_(-1,areas_min_ind.unsqueeze(dim=-1),1)]#[batch_size*h*w,4]
+        reg_targets=torch.reshape(reg_targets,(batch_size,-1,4))#[batch_size,h*w,4]
 
-                lr_min = torch.min(reg_selected[:, 0], reg_selected[:, 2])
-                lr_max = torch.max(reg_selected[:, 0], reg_selected[:, 2]).clamp(min=1e-5)
-                tb_min = torch.min(reg_selected[:, 1], reg_selected[:, 3])
-                tb_max = torch.max(reg_selected[:, 1], reg_selected[:, 3]).clamp(min=1e-5)
-                centerness = torch.sqrt((lr_min * tb_min) / (lr_max * tb_max + 1e-10))
-                
-                cls_target[pos_indices] = cls_selected.unsqueeze(1)
-                reg_target[pos_indices] = reg_selected
-                cnt_target[pos_indices] = centerness.unsqueeze(1)
+        classes=torch.broadcast_tensors(classes[:,None,:],areas.long())[0]#[batch_size,h*w,m]
+        cls_targets=classes[torch.zeros_like(areas,dtype=torch.bool).scatter_(-1,areas_min_ind.unsqueeze(dim=-1),1)]
+        cls_targets=torch.reshape(cls_targets,(batch_size,-1,1))#[batch_size,h*w,1]
 
-            cls_list.append(cls_target)
-            cnt_list.append(cnt_target)
-            reg_list.append(reg_target)
+        left_right_min = torch.min(reg_targets[..., 0], reg_targets[..., 2])#[batch_size,h*w]
+        left_right_max = torch.max(reg_targets[..., 0], reg_targets[..., 2])
+        top_bottom_min = torch.min(reg_targets[..., 1], reg_targets[..., 3])
+        top_bottom_max = torch.max(reg_targets[..., 1], reg_targets[..., 3])
+        cnt_targets=((left_right_min*top_bottom_min)/(left_right_max*top_bottom_max+1e-10)).sqrt().unsqueeze(dim=-1)#[batch_size,h*w,1]
 
-        return torch.stack(cls_list, 0), torch.stack(cnt_list, 0), torch.stack(reg_list, 0)
+        assert reg_targets.shape==(batch_size,h_mul_w,4)
+        assert cls_targets.shape==(batch_size,h_mul_w,1)
+        assert cnt_targets.shape==(batch_size,h_mul_w,1)
 
-
-# -------------------- Loss functions (PyTorch) --------------------
-def focal_loss_from_logits(preds, targets, gamma=2.0, alpha=0.25):
-    preds = preds.sigmoid()
-    pt = preds * targets + (1 - preds) * (1 - targets)
-    w = alpha * targets + (1 - alpha) * (1 - targets)
-    return (-w * (1 - pt).pow(gamma) * torch.log(pt + 1e-12)).sum()
-
-def l1_loss(preds, targets):
-    return F.l1_loss(preds, targets, reduction='sum')
-
-def compute_cls_loss(preds, targets, mask, class_num=81):
-    batch_size = targets.shape[0]
-    preds_reshape = [p.permute(0, 2, 3, 1).reshape(batch_size, -1, class_num) for p in preds]
-    preds = torch.cat(preds_reshape, dim=1)
-    
-    mask = mask.unsqueeze(-1)
-    num_pos = torch.sum(mask.float()).clamp(min=1.0)
-    
-    # Check for empty mask before indexing
-    if num_pos == 0:
-        return torch.tensor(0.0, device=preds.device)
+        #process neg coords
+        mask_pos_2=mask_pos.long().sum(dim=-1)#[batch_size,h*w]
+        # num_pos=mask_pos_2.sum(dim=-1)
+        # assert num_pos.shape==(batch_size,)
+        mask_pos_2=mask_pos_2>=1
+        assert mask_pos_2.shape==(batch_size,h_mul_w)
+        cls_targets[~mask_pos_2]=0#[batch_size,h*w,1]
+        cnt_targets[~mask_pos_2]=-1
+        reg_targets[~mask_pos_2]=-1
         
-    preds_pos = preds[mask.expand_as(preds)].reshape(-1, class_num)
-    targets_pos = targets[mask.squeeze(-1)].reshape(-1, 1) # Corrected mask indexing for targets
-
-    targets_one_hot = torch.zeros_like(preds_pos).scatter_(1, targets_pos.long() - 1, 1) # COCO classes are 1-80
-    
-    loss = focal_loss_from_logits(preds_pos, targets_one_hot)
-    return loss / num_pos
-
-def compute_cnt_loss(preds, targets, mask):
-    preds_reshape = [p.permute(0, 2, 3, 1).reshape(targets.shape[0], -1, 1) for p in preds]
-    preds = torch.cat(preds_reshape, dim=1)
-    
-    mask = mask.unsqueeze(-1)
-    num_pos = torch.sum(mask.float()).clamp(min=1.0)
-    
-    if num_pos == 0:
-        return torch.tensor(0.0, device=preds.device)
+        return cls_targets,cnt_targets,reg_targets
+  
         
-    preds_pos = preds[mask]
-    targets_pos = targets[mask]
+def compute_cls_loss(preds,targets,mask):
+    '''
+    Args  
+    preds: list contains five level pred [batch_size,class_num,_h,_w]
+    targets: [batch_size,sum(_h*_w),1]
+    mask: [batch_size,sum(_h*_w)]
+    '''
+    batch_size=targets.shape[0]
+    preds_reshape=[]
+    class_num=preds[0].shape[1]
+    mask=mask.unsqueeze(dim=-1)
+    # mask=targets>-1#[batch_size,sum(_h*_w),1]
+    num_pos=torch.sum(mask,dim=[1,2]).clamp_(min=1).float()#[batch_size,]
+    for pred in preds:
+        pred=pred.permute(0,2,3,1)
+        pred=torch.reshape(pred,[batch_size,-1,class_num])
+        preds_reshape.append(pred)
+    preds=torch.cat(preds_reshape,dim=1)#[batch_size,sum(_h*_w),class_num]
+    assert preds.shape[:2]==targets.shape[:2]
+    loss=[]
+    for batch_index in range(batch_size):
+        pred_pos=preds[batch_index]#[sum(_h*_w),class_num]
+        target_pos=targets[batch_index]#[sum(_h*_w),1]
+        target_pos=(torch.arange(1,class_num+1,device=target_pos.device)[None,:]==target_pos).float()#sparse-->onehot
+        loss.append(focal_loss_from_logits(pred_pos,target_pos).view(1))
+    return torch.cat(loss,dim=0)/num_pos#[batch_size,]
 
-    loss = F.binary_cross_entropy_with_logits(preds_pos, targets_pos, reduction='sum')
-    return loss / num_pos
+def compute_cnt_loss(preds,targets,mask):
+    '''
+    Args  
+    preds: list contains five level pred [batch_size,1,_h,_w]
+    targets: [batch_size,sum(_h*_w),1]
+    mask: [batch_size,sum(_h*_w)]
+    '''
+    batch_size=targets.shape[0]
+    c=targets.shape[-1]
+    preds_reshape=[]
+    mask=mask.unsqueeze(dim=-1)
+    # mask=targets>-1#[batch_size,sum(_h*_w),1]
+    num_pos=torch.sum(mask,dim=[1,2]).clamp_(min=1).float()#[batch_size,]
+    for pred in preds:
+        pred=pred.permute(0,2,3,1)
+        pred=torch.reshape(pred,[batch_size,-1,c])
+        preds_reshape.append(pred)
+    preds=torch.cat(preds_reshape,dim=1)
+    assert preds.shape==targets.shape#[batch_size,sum(_h*_w),1]
+    loss=[]
+    for batch_index in range(batch_size):
+        pred_pos=preds[batch_index][mask[batch_index]]#[num_pos_b,]
+        target_pos=targets[batch_index][mask[batch_index]]#[num_pos_b,]
+        assert len(pred_pos.shape)==1
+        loss.append(nn.functional.binary_cross_entropy_with_logits(input=pred_pos,target=target_pos,reduction='sum').view(1))
+    return torch.cat(loss,dim=0)/num_pos#[batch_size,]
 
-def compute_reg_loss(preds, targets, mask):
-    preds_reshape = [p.permute(0, 2, 3, 1).reshape(targets.shape[0], -1, 4) for p in preds]
-    preds = torch.cat(preds_reshape, dim=1)
-    
-    mask = mask.unsqueeze(-1)
-    num_pos = torch.sum(mask.float()).clamp(min=1.0)
-    
-    if num_pos == 0:
-        return torch.tensor(0.0, device=preds.device)
-
-    preds_pos = preds[mask.expand_as(preds)].reshape(-1, 4)
-    targets_pos = targets[mask.expand_as(targets)].reshape(-1, 4)
-
-    # L1 loss is more stable and common for regressing l,t,r,b distances directly
-    loss = l1_loss(preds_pos, targets_pos)
-    return loss / num_pos
-
-# -------------------- Loss wrapper (PyTorch) --------------------
-class LOSS(nn.Module):
-    def __init__(self, config=None):
-        super().__init__()
-        self.config = DefaultConfig if config is None else config
-    
-    def forward(self, inputs): # RENAMED from execute to forward
-        # 1. CONVERT JITTOR INPUTS TO PYTORCH
-        preds, targets = jittor_to_torch(inputs)
-        cls_logits, cnt_logits, reg_preds = preds
-        cls_targets, cnt_targets, reg_targets = targets
-        
-        # --- All internal calculations are now in PyTorch ---
-        mask = (cnt_targets > -1)
-        if mask.ndim == 3: mask = mask.squeeze(-1)
-
-        cls_loss = compute_cls_loss(cls_logits, cls_targets, mask, self.config.class_num)
-        cnt_loss = compute_cnt_loss(cnt_logits, cnt_targets, mask)
-        reg_loss = compute_reg_loss(reg_preds, reg_targets, mask)
-
-        if self.config.add_centerness:
-            total = cls_loss + cnt_loss + reg_loss
+def compute_reg_loss(preds,targets,mask,mode='giou'):
+    '''
+    Args  
+    preds: list contains five level pred [batch_size,4,_h,_w]
+    targets: [batch_size,sum(_h*_w),4]
+    mask: [batch_size,sum(_h*_w)]
+    '''
+    batch_size=targets.shape[0]
+    c=targets.shape[-1]
+    preds_reshape=[]
+    # mask=targets>-1#[batch_size,sum(_h*_w),4]
+    num_pos=torch.sum(mask,dim=1).clamp_(min=1).float()#[batch_size,]
+    for pred in preds:
+        pred=pred.permute(0,2,3,1)
+        pred=torch.reshape(pred,[batch_size,-1,c])
+        preds_reshape.append(pred)
+    preds=torch.cat(preds_reshape,dim=1)
+    assert preds.shape==targets.shape#[batch_size,sum(_h*_w),4]
+    loss=[]
+    for batch_index in range(batch_size):
+        pred_pos=preds[batch_index][mask[batch_index]]#[num_pos_b,4]
+        target_pos=targets[batch_index][mask[batch_index]]#[num_pos_b,4]
+        assert len(pred_pos.shape)==2
+        if mode=='iou':
+            loss.append(iou_loss(pred_pos,target_pos).view(1))
+        elif mode=='giou':
+            loss.append(giou_loss(pred_pos,target_pos).view(1))
         else:
-            total = cls_loss + reg_loss
-        
-        # 2. CONVERT PYTORCH RESULTS BACK TO JITTOR
-        return (torch_to_jittor(cls_loss),
-                torch_to_jittor(cnt_loss),
-                torch_to_jittor(reg_loss),
-                torch_to_jittor(total))
+            raise NotImplementedError("reg loss only implemented ['iou','giou']")
+    return torch.cat(loss,dim=0)/num_pos#[batch_size,]
+
+def iou_loss(preds,targets):
+    '''
+    Args:
+    preds: [n,4] ltrb
+    targets: [n,4]
+    '''
+    lt=torch.min(preds[:,:2],targets[:,:2])
+    rb=torch.min(preds[:,2:],targets[:,2:])
+    wh=(rb+lt).clamp(min=0)
+    overlap=wh[:,0]*wh[:,1]#[n]
+    area1=(preds[:,2]+preds[:,0])*(preds[:,3]+preds[:,1])
+    area2=(targets[:,2]+targets[:,0])*(targets[:,3]+targets[:,1])
+    iou=overlap/(area1+area2-overlap)
+    loss=-iou.clamp(min=1e-6).log()
+    return loss.sum()
+
+def giou_loss(preds,targets):
+    '''
+    Args:
+    preds: [n,4] ltrb
+    targets: [n,4]
+    '''
+    lt_min=torch.min(preds[:,:2],targets[:,:2])
+    rb_min=torch.min(preds[:,2:],targets[:,2:])
+    wh_min=(rb_min+lt_min).clamp(min=0)
+    overlap=wh_min[:,0]*wh_min[:,1]#[n]
+    area1=(preds[:,2]+preds[:,0])*(preds[:,3]+preds[:,1])
+    area2=(targets[:,2]+targets[:,0])*(targets[:,3]+targets[:,1])
+    union=(area1+area2-overlap)
+    iou=overlap/union
+
+    lt_max=torch.max(preds[:,:2],targets[:,:2])
+    rb_max=torch.max(preds[:,2:],targets[:,2:])
+    wh_max=(rb_max+lt_max).clamp(0)
+    G_area=wh_max[:,0]*wh_max[:,1]#[n]
+
+    giou=iou-(G_area-union)/G_area.clamp(1e-10)
+    loss=1.-giou
+    return loss.sum()
+
+def focal_loss_from_logits(preds,targets,gamma=2.0,alpha=0.25):
+    '''
+    Args:
+    preds: [n,class_num] 
+    targets: [n,class_num]
+    '''
+    preds=preds.sigmoid()
+    pt=preds*targets+(1.0-preds)*(1.0-targets)
+    w=alpha*targets+(1.0-alpha)*(1.0-targets)
+    loss=-w*torch.pow((1.0-pt),gamma)*pt.log()
+    return loss.sum()
+
+
+
+
+class LOSS(nn.Module):
+    def __init__(self,config=None):
+        super().__init__()
+        if config is None:
+            self.config=DefaultConfig
+        else:
+            self.config=config
+    def forward(self,inputs):
+        '''
+        inputs list
+        [0]preds:  ....
+        [1]targets : list contains three elements [[batch_size,sum(_h*_w),1],[batch_size,sum(_h*_w),1],[batch_size,sum(_h*_w),4]]
+        '''
+        preds,targets=inputs
+        cls_logits,cnt_logits,reg_preds=preds
+        cls_targets,cnt_targets,reg_targets=targets
+        mask_pos=(cnt_targets>-1).squeeze(dim=-1)# [batch_size,sum(_h*_w)]
+        cls_loss=compute_cls_loss(cls_logits,cls_targets,mask_pos).mean()#[]
+        cnt_loss=compute_cnt_loss(cnt_logits,cnt_targets,mask_pos).mean()
+        reg_loss=compute_reg_loss(reg_preds,reg_targets,mask_pos).mean()
+        if self.config.add_centerness:
+            total_loss=cls_loss+cnt_loss+reg_loss
+            return cls_loss,cnt_loss,reg_loss,total_loss
+        else:
+            total_loss=cls_loss+reg_loss+cnt_loss*0.0
+            return cls_loss,cnt_loss,reg_loss,total_loss
+
+if __name__=="__main__":
+    loss=compute_cnt_loss([torch.ones([2,1,4,4])]*5,torch.ones([2,80,1]),torch.ones([2,80],dtype=torch.bool))
+    print(loss)
+
+
