@@ -1,8 +1,8 @@
 class DefaultConfig():
     #backbone
-    pretrained=True
-    freeze_stage_1=True
-    freeze_bn=True
+    pretrained=True #### should be true
+    freeze_stage_1= True
+    freeze_bn= True
 
     #fpn
     fpn_out_channels=256

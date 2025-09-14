@@ -4,7 +4,7 @@ import math
 from PIL import Image
 import random
 import numpy as np
-
+import cv2
 
 class Transforms(object):
     def __init__(self):
@@ -24,48 +24,47 @@ def colorJitter(img, boxes, brightness=0.1, contrast=0.1, saturation=0.1, hue=0.
                                  contrast=contrast, saturation=saturation, hue=hue)(img)
     return img, boxes
 
-def random_rotation(img, boxes, degree=10):
-    d = random.uniform(-degree, degree)
-    w, h = img.size
-    rx0, ry0 = w / 2.0, h / 2.0
-    img = img.rotate(d)
+def random_rotation(img, boxes):
+    # Convert image to numpy array if it's not already.
+    # The 'shape' attribute does not exist on a PIL 'Image' object.
+    if not isinstance(img, np.ndarray):
+        img = np.array(img)
 
-    a = -d / 180.0 * math.pi
-    boxes = jt.array(boxes)
-    new_boxes = jt.zeros_like(boxes)
-    new_boxes[:, 0] = boxes[:, 1]
-    new_boxes[:, 1] = boxes[:, 0]
-    new_boxes[:, 2] = boxes[:, 3]
-    new_boxes[:, 3] = boxes[:, 2]
+    # Rotates the image randomly between -10 and 10 degrees.
+    angle = random.randint(-10, 10)
+    h, w, c = img.shape
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1)
+    img = cv2.warpAffine(img, M, (w, h), borderValue=(128, 128, 128))
+
+    # Convert rotated image to Jittor tensor, normalize, and transpose dimensions.
+    img = jt.array(img).float32() / 255.0
+    img = jt.transpose(img, [2, 0, 1])
+
+    # Get rotated points
+    x = boxes[:, [0, 2]]
+    y = boxes[:, [1, 3]]
+    tp = jt.array([[x[0], y[0]], [x[1], y[0]], [x[0], y[1]], [x[1], y[1]]])
+    tp = jt.reshape(tp, (-1, 2)).transpose(1, 0)
     
-    for i in range(boxes.shape[0]):
-        ymin, xmin, ymax, xmax = new_boxes[i, :]
-        xmin, ymin, xmax, ymax = float(xmin), float(ymin), float(xmax), float(ymax)
-        x0, y0 = xmin, ymin
-        x1, y1 = xmin, ymax
-        x2, y2 = xmax, ymin
-        x3, y3 = xmax, ymax
-        
-        z = jt.float32([[y0, x0], [y1, x1], [y2, x2], [y3, x3]])
-        tp = jt.zeros_like(z)
-        tp[:, 1] = (z[:, 1] - rx0) * math.cos(a) - (z[:, 0] - ry0) * math.sin(a) + rx0
-        tp[:, 0] = (z[:, 1] - rx0) * math.sin(a) + (z[:, 0] - ry0) * math.cos(a) + ry0
-        
-        ymax, xmax = jt.max(tp, dim=0)[0]
-        ymin, xmin = jt.min(tp, dim=0)[0]
-        new_boxes[i] = jt.stack([ymin, xmin, ymax, xmax])
-    
-    new_boxes[:, 1::2] = new_boxes[:, 1::2].clamp(min_v=0, max_v=w - 1)
-    new_boxes[:, 0::2] = new_boxes[:, 0::2].clamp(min_v=0, max_v=h - 1)
-    
-    boxes = jt.float32(boxes)
-    boxes[:, 0] = new_boxes[:, 1]
-    boxes[:, 1] = new_boxes[:, 0]
-    boxes[:, 2] = new_boxes[:, 3]
-    boxes[:, 3] = new_boxes[:, 2]
-    
-    boxes = boxes.numpy()
-    return img, boxes
+    # Pad points with 1 for matrix multiplication
+    tp = jt.concat((tp, jt.ones((1, tp.shape[1]))), dim=0)
+
+    # Convert rotation matrix to Jittor Var for multiplication
+    M = jt.array(M)
+    new_points = M @ tp
+
+    # Calculate new bounding box
+    # The original code caused an error due to incorrect unpacking.
+    # We now find the maximum x and y coordinates separately.
+    ymax = jt.max(new_points[0]).item()
+    xmax = jt.max(new_points[1]).item()
+    ymin = jt.min(new_points[0]).item()
+    xmin = jt.min(new_points[1]).item()
+
+    # Reformat the bounding boxes
+    new_boxes = jt.stack([ymin, xmin, ymax, xmax]).transpose(0, 1)
+    return img, new_boxes
+
 
 
 def _box_inter(box1, box2):
