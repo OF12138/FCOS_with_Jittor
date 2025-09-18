@@ -14,7 +14,7 @@ from tensorboardX import SummaryWriter
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--epochs", type=int, default=1, help="number of epochs")
+parser.add_argument("--epochs", type=int, default=200, help="number of epochs")
 parser.add_argument("--batch_size", type=int, default=1, help="size of each image batch")
 parser.add_argument("--n_cpu", type=int, default=0, help="number of cpu threads to use during batch generation")
 parser.add_argument("--n_gpu", type=str, default='0', help="not used in jittor, set via jt.flags.use_cuda")
@@ -40,7 +40,7 @@ train_loader = DataLoader(train_dataset,
                         collate_fn=train_dataset.collate_fn,
                         )
 
-writer=SummaryWriter('logs/FCOS_experiment_5')
+writer=SummaryWriter('logs/FCOS_experiment_f_1')
 model = FCOSDetector(mode="training")
 
 BATCH_SIZE = opt.batch_size
@@ -57,7 +57,12 @@ optimizer = jt.optim.SGD(model.parameters(),
                         lr=LR_INIT,
                         momentum=0.9,
                         weight_decay=0.0001,
-                        )
+                       )
+# train.py (New Version)
+#optimizer = jt.optim.AdamW(model.parameters(),
+#                           lr=LR_INIT,
+#                           weight_decay=0.0001
+#                          )
 
 # set the learning rate scheduler
 lr_schedule = [120000, 160000]
@@ -83,19 +88,19 @@ for epoch in range(EPOCHS):
         # Data is already on the correct device with Jittor, no need for .cuda()
         batch_imgs, batch_boxes, batch_classes ,batch_scales = data
 
-        # --- ADD THIS DEBUGGING BLOCK ---
-        print("\n" + "="*40)
-        print(f"DEBUG INFO FOR: global_step={GLOBAL_STEPS}")
-        print("="*40)
-        print(f"[TRAIN] Image batch shape: {batch_imgs.shape}, Scales: {batch_scales.numpy().flatten().tolist()}")
-        # Print up to 5 sample boxes and classes to check their values
-        num_boxes_to_print = min(5, batch_boxes.shape[1])
-        if batch_boxes.numel() > 0:
-            print(f"[TRAIN] Sample GT Boxes (first {num_boxes_to_print}):\n{batch_boxes[0, :num_boxes_to_print, :].numpy()}")
-            print(f"[TRAIN] Sample GT Classes (first {num_boxes_to_print}): {batch_classes[0, :num_boxes_to_print].numpy()}")
-        else:
-            print("[TRAIN] No GT Boxes in this batch.")
-        # --- END OF DEBUGGING BLOCK ---
+        # --- START: ADD THIS DEBUG BLOCK ---
+        if GLOBAL_STEPS < 2: # Print for the first 2 steps
+            print("\n" + "="*40)
+            print(f"DEBUG INFO FOR: global_step={GLOBAL_STEPS}")
+            print("="*40)
+            print(f"[TRAIN] Image batch shape: {batch_imgs.shape}, Scales: {batch_scales.numpy().flatten().tolist()}")
+            num_boxes_to_print = min(2, batch_boxes.shape[1])
+            if batch_boxes.numel() > 0 and batch_boxes[0,0,0].item() != -1:
+                print(f"[TRAIN] Sample GT Boxes (first {num_boxes_to_print}):\n{batch_boxes[0, :num_boxes_to_print, :].numpy()}")
+                print(f"[TRAIN] Sample GT Classes (first {num_boxes_to_print}): {batch_classes[0, :num_boxes_to_print].numpy()}")
+            else:
+                print("[TRAIN] No valid GT Boxes in this batch.")
+        # --- END: ADD THIS DEBUG BLOCK ---
 
 
         lr = lr_func(GLOBAL_STEPS)
@@ -128,7 +133,12 @@ for epoch in range(EPOCHS):
         if cls_loss.item() > 0 or cnt_loss.item() > 0 or reg_loss.item() > 0:
             epoch_has_meaningful_loss = True
 
-        optimizer.step(loss.mean())
+        #optimizer.step(loss.mean())
+        #optimizer.zero_grad()
+        optimizer.backward(loss)
+        optimizer.clip_grad_norm(max_norm=35.0) # Clip the gradients
+        optimizer.step() # Apply the clipped gradients
+        
 
         end_time = time.time()
         cost_time = int((end_time - start_time) * 1000)

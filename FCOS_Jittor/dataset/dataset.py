@@ -71,7 +71,8 @@ class COCODataset(Dataset):
         'book', 'clock', 'vase', 'scissors', 'teddy bear',
         'hair drier', 'toothbrush')
 
-    def __init__(self, imgs_path, anno_path, resize_size=[800, 1333], is_train=True, transform=None):
+#the resize_size should be[800,1333]
+    def __init__(self, imgs_path, anno_path, resize_size=[640,640], is_train=True, transform=None):
         super().__init__()
         self.imgs_path = imgs_path
         self.coco = COCO(anno_path)

@@ -75,7 +75,7 @@ if __name__ == "__main__":
     # Load state dict
     #state_dict = jt.load("./checkpoint/model_4.pth")
     #model.load_state_dict(state_dict)
-    model.load("./checkpoint/model_5.pth")
+    model.load("./checkpoint/model_24.pth")
     
     # Set to evaluation mode
     model.eval()
@@ -89,7 +89,7 @@ if __name__ == "__main__":
     names = os.listdir(root)
     for name in names:
         img_bgr = cv2.imread(root + name)
-        img_pad = preprocess_img(img_bgr, [800, 1333])
+        img_pad = preprocess_img(img_bgr, [800, 1333])# should be[800, 1333]
         img = cv2.cvtColor(img_pad.copy(), cv2.COLOR_BGR2RGB)
         
         # Convert to Jittor tensor

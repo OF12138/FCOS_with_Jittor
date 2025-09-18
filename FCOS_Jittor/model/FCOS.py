@@ -65,6 +65,7 @@ class DetectHead(nn.Module):
         else:
             self.config = config
 
+
     def execute(self, inputs):
         # Unpack the lists of feature maps from the FCOS head
         cls_logits_list, cnt_logits_list, reg_preds_list = inputs
@@ -110,6 +111,8 @@ class DetectHead(nn.Module):
         assert boxes_topk.shape[-1] == 4
 
         return self._post_process([cls_scores_topk, cls_classes_topk, boxes_topk])
+
+
 
     def _post_process(self, preds_topk):
         _cls_scores_post = []
@@ -260,9 +263,14 @@ class FCOSDetector(nn.Module):
         if self.mode == "training":
             batch_imgs, batch_boxes, batch_classes, batch_scales = inputs
             out = self.fcos_body(batch_imgs)
-            cls_targets, cnt_targets, reg_targets, coords_target = self.target_layer([out, batch_boxes, batch_classes,batch_scales])
-            targets = [cls_targets, cnt_targets, reg_targets]
-            losses = self.loss_layer([out, targets,coords_target])
+            # NEW, CORRECTED CODE
+            out = self.fcos_body(batch_imgs)
+
+            # The target_layer now returns a single tuple/list with 4 items
+            targets_with_coords = self.target_layer([out, batch_boxes, batch_classes, batch_scales])
+
+            # The loss_layer expects a list of [predictions, targets_with_coords]
+            losses = self.loss_layer(out, targets_with_coords)
             return losses
         elif self.mode == "inference":
             batch_imgs = inputs

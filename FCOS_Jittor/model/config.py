@@ -5,7 +5,7 @@ class DefaultConfig():
     freeze_bn= True
 
     #fpn
-    fpn_out_channels=256
+    fpn_out_channels= 256# should be 256
     use_p5=True
     
     #head
