@@ -44,7 +44,12 @@ ATSS-FCOS in Jittor/Pytorch<br>
 
 ## Result Display<br>
 ### Loss in tensorboard<br>
+![Loss](/visualization_loss.png)<br>
+![Detection](/visualization_detection.png)<br>
 
+## Claim
+This Project could hardly detect objects correctly.<br>
+There are some problems remain to be solved.<br>
 
 
 
