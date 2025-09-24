@@ -29,12 +29,12 @@ Or you can change the pretrained parameter from True to False in config.py<br>
 
 ## Structure of Project<br>
 ATSS-FCOS in Jittor/Pytorch<br>
-├── dataset<br>                  
+├── dataset<br>  
 │   ├── augmentation.py             //to preprocess the images<br>
 │   └── dataset.py<br>
 ├── model                           //this is the folder where backbone net locates<br>
 │   ├── config.py<br>
-│   ├── FCOS.py<br>          
+│   ├── FCOS.py<br>
 │   ├── fpn.py<br>
 │   ├── head.py<br>
 │   ├── loss.py                     //the ATSS trick is applied here<br>
@@ -50,6 +50,8 @@ ATSS-FCOS in Jittor/Pytorch<br>
 ## Claim
 This Project could hardly detect objects correctly.<br>
 There are some problems remain to be solved.<br>
+The GPU sources are limited and the neural network isn't perfect either.<br>
+
 
 
 
