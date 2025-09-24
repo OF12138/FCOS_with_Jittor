@@ -3,6 +3,30 @@ import torch.nn as nn
 from .config import DefaultConfig
 
 
+#--ATSS--
+def compute_iou(boxes1, boxes2):
+    """
+    Computes IoU between two sets of boxes in (x1, y1, x2, y2) format.
+    boxes1: (N, 4) tensor of boxes
+    boxes2: (M, 4) tensor of boxes
+    Returns: (N, M) tensor of IoUs.
+    """
+    # Calculate intersection area
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N, M, 2]
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N, M, 2]
+    wh = (rb - lt).clamp(min=0)  # [N, M, 2]
+    intersection = wh[:, :, 0] * wh[:, :, 1]  # [N, M]
+
+    # Calculate union area
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])  # [N]
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])  # [M]
+    union = area1[:, None] + area2 - intersection
+
+    # Calculate IoU
+    iou = intersection / (union + 1e-6)
+    return iou
+
+
 def coords_fmap2orig(feature,stride):
     '''
     transfor one fmap coords to orig coords
@@ -142,6 +166,104 @@ class GenTargets(nn.Module):
         mask_pos_2=mask_pos_2>=1
         assert mask_pos_2.shape==(batch_size,h_mul_w)
         cls_targets[~mask_pos_2]=0#[batch_size,h*w,1]
+        cnt_targets[~mask_pos_2]=-1
+        reg_targets[~mask_pos_2]=-1
+        
+        return cls_targets,cnt_targets,reg_targets
+
+    def _gen_level_targets_atss(self,out,gt_boxes,classes,stride,limit_range,sample_radiu_ratio=1.5):
+        cls_logits,cnt_logits,reg_preds=out
+        batch_size=cls_logits.shape[0]
+        class_num=cls_logits.shape[1]
+        m=gt_boxes.shape[1]
+
+        cls_logits=cls_logits.permute(0,2,3,1)
+        coords=coords_fmap2orig(cls_logits,stride).to(device=gt_boxes.device)
+        
+        cls_logits=cls_logits.reshape((batch_size,-1,class_num))
+        cnt_logits=cnt_logits.permute(0,2,3,1).reshape((batch_size,-1,1))
+        reg_preds=reg_preds.permute(0,2,3,1).reshape((batch_size,-1,4))
+
+        h_mul_w=cls_logits.shape[1]
+
+        x=coords[:,0]
+        y=coords[:,1]
+        l_off=x[None,:,None]-gt_boxes[...,0][:,None,:]
+        t_off=y[None,:,None]-gt_boxes[...,1][:,None,:]
+        r_off=gt_boxes[...,2][:,None,:]-x[None,:,None]
+        b_off=gt_boxes[...,3][:,None,:]-y[None,:,None]
+        ltrb_off=torch.stack([l_off,t_off,r_off,b_off],dim=-1)
+
+        areas=(ltrb_off[...,0]+ltrb_off[...,2])*(ltrb_off[...,1]+ltrb_off[...,3])
+        off_min=torch.min(ltrb_off,dim=-1)[0]
+        mask_in_gtboxes=off_min>0
+        
+        # ---- START OF CHANGES: Simplified ATSS with Bug Fix ----
+        ious_all = []
+        for b in range(batch_size):
+            # Filter out padded GT boxes for this image
+            gt_boxes_b = gt_boxes[b]
+            valid_gt_mask = gt_boxes_b[:, 0] != -1
+            gt_boxes_b = gt_boxes_b[valid_gt_mask]
+            ltrb_off_b = ltrb_off[b][:, valid_gt_mask] # Shape: [h*w, num_valid_gt, 4]
+            
+            if gt_boxes_b.shape[0] == 0: # If no GT boxes in this image
+                ious_all.append(torch.zeros(h_mul_w, m, device=coords.device))
+                continue
+                
+            # BUG FIX: Corrected broadcasting for creating predicted boxes
+            # Coords shape: [h*w, 2] -> unsqueeze to [h*w, 1, 2]
+            # ltrb_off_b shape: [h*w, num_valid_gt, 4]
+            coords_unsqueezed = coords.unsqueeze(1)
+            pred_boxes_x1y1 = coords_unsqueezed - ltrb_off_b[..., :2] # Result: [h*w, num_valid_gt, 2]
+            pred_boxes_x2y2 = coords_unsqueezed + ltrb_off_b[..., 2:] # Result: [h*w, num_valid_gt, 2]
+            pred_boxes_for_gt = torch.cat([pred_boxes_x1y1, pred_boxes_x2y2], dim=-1) # Result: [h*w, num_valid_gt, 4]
+
+            # Vectorized IoU calculation
+            # gt_boxes_b shape: [num_valid_gt, 4]
+            # pred_boxes_for_gt shape: [h*w, num_valid_gt, 4]
+            # We want to compare each GT with its corresponding column of predicted boxes
+            ious_b = compute_iou(
+                pred_boxes_for_gt.reshape(-1, 4), # Shape: [h*w * num_valid_gt, 4]
+                gt_boxes_b
+            ).reshape(h_mul_w, gt_boxes_b.shape[0], gt_boxes_b.shape[0]) # Shape: [h*w, num_valid_gt, num_valid_gt]
+
+            # We only need the diagonal: IoU of GT_i with predictions for GT_i
+            ious_b = torch.diagonal(ious_b, dim1=1, dim2=2) # Shape: [h*w, num_valid_gt]
+            
+            # Pad back to original size 'm'
+            padded_ious = torch.zeros(h_mul_w, m, device=coords.device)
+            padded_ious[:, valid_gt_mask] = ious_b
+            ious_all.append(padded_ious)
+
+        ious = torch.stack(ious_all, dim=0)
+        
+        ious_valid = ious * mask_in_gtboxes
+        iou_mean = torch.sum(ious_valid, dim=1, keepdim=True) / torch.sum(mask_in_gtboxes, dim=1, keepdim=True).clamp(min=1)
+        iou_std = torch.sqrt(torch.sum(torch.pow(ious_valid - iou_mean, 2) * mask_in_gtboxes, dim=1, keepdim=True) / torch.sum(mask_in_gtboxes, dim=1, keepdim=True).clamp(min=1))
+        
+        atss_threshold = iou_mean + iou_std
+        mask_atss = ious >= atss_threshold
+        mask_pos = mask_in_gtboxes & mask_atss
+        # ---- END OF CHANGES ----
+
+        areas[~mask_pos]=99999999
+        areas_min_ind=torch.min(areas,dim=-1)[1]
+        reg_targets=ltrb_off[torch.zeros_like(areas,dtype=torch.bool).scatter_(-1,areas_min_ind.unsqueeze(dim=-1),1)]
+        reg_targets=torch.reshape(reg_targets,(batch_size,-1,4))
+
+        classes=torch.broadcast_tensors(classes[:,None,:],areas.long())[0]
+        cls_targets=classes[torch.zeros_like(areas,dtype=torch.bool).scatter_(-1,areas_min_ind.unsqueeze(dim=-1),1)]
+        cls_targets=torch.reshape(cls_targets,(batch_size,-1,1))
+
+        left_right_min = torch.min(reg_targets[..., 0], reg_targets[..., 2])
+        left_right_max = torch.max(reg_targets[..., 0], reg_targets[..., 2])
+        top_bottom_min = torch.min(reg_targets[..., 1], reg_targets[..., 3])
+        top_bottom_max = torch.max(reg_targets[..., 1], reg_targets[..., 3])
+        cnt_targets=((left_right_min*top_bottom_min)/(left_right_max*top_bottom_max+1e-10)).sqrt().unsqueeze(dim=-1)
+
+        mask_pos_2=mask_pos.long().sum(dim=-1)>=1
+        cls_targets[~mask_pos_2]=0
         cnt_targets[~mask_pos_2]=-1
         reg_targets[~mask_pos_2]=-1
         
@@ -315,8 +437,70 @@ class LOSS(nn.Module):
             total_loss=cls_loss+reg_loss+cnt_loss*0.0
             return cls_loss,cnt_loss,reg_loss,total_loss
 
-if __name__=="__main__":
-    loss=compute_cnt_loss([torch.ones([2,1,4,4])]*5,torch.ones([2,80,1]),torch.ones([2,80],dtype=torch.bool))
-    print(loss)
+
+#--test--
+
+
+
+
+if __name__ == "__main__":
+    # 1. Configuration and Layer Instantiation
+    strides = [8, 16, 32, 64, 128]
+    limit_range = [[-1, 64], [64, 128], [128, 256], [256, 512], [512, 999999]]
+    gen_targets_layer = GenTargets(strides=strides, limit_range=limit_range)
+
+    # 2. Create Mock/Fake Data to Simulate Real Inputs
+    batch_size = 2
+    class_num = 80
+    num_gt = 5  # Max number of ground truth boxes per image in a batch
+    
+    # Mock model predictions from the FPN
+    fpn_out_shapes = [(100, 168), (50, 84), (25, 42), (13, 21), (7, 11)]  # Example H, W for each FPN level
+    cls_logits = [torch.randn(batch_size, class_num, h, w) for h, w in fpn_out_shapes]
+    cnt_logits = [torch.randn(batch_size, 1, h, w) for h, w in fpn_out_shapes]
+    reg_preds = [torch.abs(torch.randn(batch_size, 4, h, w)) for h, w in fpn_out_shapes]
+    preds = [cls_logits, cnt_logits, reg_preds]
+
+    # Mock ground truth boxes and classes
+    gt_boxes = torch.rand(batch_size, num_gt, 4) * 200  # Random boxes with coords up to 200
+    gt_boxes[..., 2:] += gt_boxes[..., :2] + 20 # Ensure x2 > x1 and y2 > y1, with a minimum size of 20
+    
+    # Simulate padding by setting the last box of the first image to -1
+    gt_boxes[0, -1, :] = -1
+    
+    classes = torch.randint(1, class_num + 1, (batch_size, num_gt))
+    classes[0, -1] = -1
+
+    # 3. Run the Test and Print Results
+    print("--- Running GenTargets Test with Mock Data ---")
+    try:
+        # Call the forward method to generate targets
+        cls_targets, cnt_targets, reg_targets = gen_targets_layer([preds, gt_boxes, classes])
+        
+        # 4. Print Output Shapes and Info
+        print("\n✅ Successfully generated targets!")
+        print(f"   cls_targets shape: {cls_targets.shape}")
+        print(f"   cnt_targets shape: {cnt_targets.shape}")
+        print(f"   reg_targets shape: {reg_targets.shape}")
+        
+        # Check if any positive samples were found (important sanity check)
+        num_pos = (cnt_targets > -1).sum().item()
+        print(f"\nTotal positive samples found across batch: {num_pos}")
+
+        if num_pos == 0:
+            print("⚠️ Warning: No positive samples were assigned. This can happen with random data,")
+            print("   but if it persists with real data, your ATSS thresholds might be too strict.")
+
+    except Exception as e:
+        print(f"\n❌ ERROR ---")
+        print(f"An error occurred during the test: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\n--- Debugging Tips ---")
+        print("1. Double-check tensor shapes inside the `_gen_level_targets` function.")
+        print("2. The error might be due to incorrect broadcasting or an edge case (e.g., no GT boxes).")
+    
+
+    
 
 

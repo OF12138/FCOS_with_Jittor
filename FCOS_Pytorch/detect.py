@@ -8,7 +8,7 @@ import time
 import matplotlib.patches as patches
 import  matplotlib.pyplot as plt
 from matplotlib.ticker import NullLocator
-
+from collections import OrderedDict
 
 def preprocess_img(image,input_ksize):
     '''
@@ -95,7 +95,19 @@ if __name__=="__main__":
     # print("INFO===>success convert BN to SyncBN")
 
     model = torch.nn.DataParallel(model)
-    model.load_state_dict(torch.load("./checkpoint/model_1.pth",map_location=torch.device('cpu')))
+
+    # Load the checkpoint
+    device = torch.device('cpu')
+    state_dict = torch.load("./checkpoint/model_20.pth", map_location=device, weights_only=True)
+
+    # Create a new state_dict with the 'module.' prefix
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = 'module.' + k  # add `module.` prefix
+        new_state_dict[name] = v
+
+    # Load the new state_dict
+    model.load_state_dict(new_state_dict)
     # model=convertSyncBNtoBN(model)
     # print("INFO===>success convert SyncBN to BN")
 

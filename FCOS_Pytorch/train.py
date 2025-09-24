@@ -8,10 +8,11 @@ import numpy as np
 import random
 import torch.backends.cudnn as cudnn
 import argparse
+from tensorboardX import SummaryWriter
 
 parser = argparse.ArgumentParser() #allow the command line arguments
 #add command line arguments
-parser.add_argument("--epochs", type=int, default=1, help="number of epochs")
+parser.add_argument("--epochs", type=int, default=20, help="number of epochs")
 parser.add_argument("--batch_size", type=int, default=1, help="size of each image batch")
 parser.add_argument("--n_cpu", type=int, default=0, help="number of cpu threads to use during batch generation")
 parser.add_argument("--n_gpu", type=str, default='0', help="number of cpu threads to use during batch generation")
@@ -19,14 +20,6 @@ opt = parser.parse_args() #store the arguments in opt
 
 #set the environment
 os.environ["CUDA_VISIBLE_DEVICES"]=opt.n_gpu
-#make the result reproducible
-#torch.manual_seed(0)
-#torch.cuda.manual_seed(0)
-#torch.cuda.manual_seed_all(0)
-#np.random.seed(0)
-#cudnn.benchmark = False
-#cudnn.deterministic = True
-#random.seed(0)
 
 #set the dataset
 transform = Transforms()
@@ -40,11 +33,10 @@ train_loader=torch.utils.data.DataLoader(train_dataset,
                                          shuffle=True,
                                          collate_fn=train_dataset.collate_fn, #to tensor
                                          num_workers=opt.n_cpu,
-                                         #worker_init_fn = np.random.seed(0),
                                          )
 
+writer=SummaryWriter('logs/FCOS_experiment_pytorch_final')
 model=FCOSDetector(mode="training").cuda() #instance of model
-#model = torch.nn.DataParallel(model) #multiple GPUs
 BATCH_SIZE=opt.batch_size
 EPOCHS=opt.epochs
 
@@ -98,6 +90,14 @@ for epoch in range(EPOCHS):
         optimizer.zero_grad()
         losses=model([batch_imgs,batch_boxes,batch_classes])
         loss=losses[-1]
+
+        writer.add_scalar('Loss/Total', loss.mean().item(), GLOBAL_STEPS)
+        writer.add_scalar('Loss/Classification', losses[0].mean().item(), GLOBAL_STEPS)
+        writer.add_scalar('Loss/Centerness', losses[1].mean().item(), GLOBAL_STEPS)
+        writer.add_scalar('Loss/Regression', losses[2].mean().item(), GLOBAL_STEPS)
+        writer.add_scalar('LearningRate', lr, GLOBAL_STEPS)
+
+
         loss.mean().backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(),3)  #prevents the "exploding gradient", the 3 is the threshold
         optimizer.step()
@@ -110,6 +110,8 @@ for epoch in range(EPOCHS):
 
 
         GLOBAL_STEPS+=1
+
+    writer.close()
     
     torch.save(model.state_dict(),"./checkpoint/model_{}.pth".format(epoch+1))
     

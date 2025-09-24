@@ -1,12 +1,18 @@
 import jittor as jt
 import jittor.nn as nn
-
+import numpy as np
 from .head import ClsCntRegHead
 from .fpn import FPN
 from .resnet import resnet50
 from .loss import GenTargets, LOSS, coords_fmap2orig
 from .config import DefaultConfig
-
+import math
+""" from head import ClsCntRegHead
+from fpn import FPN
+from resnet import resnet50
+from loss import GenTargets, LOSS, coords_fmap2orig
+from config import DefaultConfig
+import math  """
 
 class FCOS(nn.Module):
     def __init__(self, config=None):
@@ -278,3 +284,281 @@ class FCOSDetector(nn.Module):
             scores, classes, boxes = self.detection_head(out)
             boxes = self.clip_boxes(batch_imgs, boxes)
             return scores, classes, boxes
+
+#--test--
+
+
+
+
+
+
+if __name__ == '__main__':
+    # This main block is for testing and comparing the full FCOSDetector against a PyTorch implementation.
+    
+    # Import PyTorch
+    try:
+        import torch
+    except ImportError:
+        print("PyTorch not found. Skipping comparison test.")
+        exit()
+    
+    # --- START: Self-Contained PyTorch Implementation ---
+    
+    class BottleneckPytorch(torch.nn.Module):
+        expansion = 4
+        def __init__(self, inplanes, planes, stride=1, downsample=None):
+            super().__init__()
+            self.conv1 = torch.nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
+            self.bn1 = torch.nn.BatchNorm2d(planes)
+            self.conv2 = torch.nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+            self.bn2 = torch.nn.BatchNorm2d(planes)
+            self.conv3 = torch.nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
+            self.bn3 = torch.nn.BatchNorm2d(planes * 4)
+            self.relu = torch.nn.ReLU(inplace=True)
+            self.downsample = downsample
+        def forward(self, x):
+            residual = x
+            out = self.conv1(x)
+            out = self.bn1(out)
+            out = self.relu(out)
+            out = self.conv2(out)
+            out = self.bn2(out)
+            out = self.relu(out)
+            out = self.conv3(out)
+            out = self.bn3(out)
+            if self.downsample is not None:
+                residual = self.downsample(x)
+            out += residual
+            out = self.relu(out)
+            return out
+
+    class MockResNet50Pytorch(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inplanes = 64
+            self.conv1 = torch.nn.Conv2d(3, 64, 7, 2, 3, bias=False)
+            self.bn1 = torch.nn.BatchNorm2d(64)
+            self.relu = torch.nn.ReLU(inplace=True)
+            self.maxpool = torch.nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+            self.layer1 = self._make_layer(BottleneckPytorch, 64, 3)
+            self.layer2 = self._make_layer(BottleneckPytorch, 128, 4, stride=2)
+            self.layer3 = self._make_layer(BottleneckPytorch, 256, 6, stride=2)
+            self.layer4 = self._make_layer(BottleneckPytorch, 512, 3, stride=2)
+
+        def _make_layer(self, block, planes, blocks, stride=1):
+            downsample = None
+            if stride != 1 or self.inplanes != planes * block.expansion:
+                downsample = torch.nn.Sequential(
+                    torch.nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                    torch.nn.BatchNorm2d(planes * block.expansion)
+                )
+            layers = [block(self.inplanes, planes, stride, downsample)]
+            self.inplanes = planes * block.expansion
+            for _ in range(1, blocks):
+                layers.append(block(self.inplanes, planes))
+            return torch.nn.Sequential(*layers)
+
+        def forward(self, x):
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = self.relu(x)
+            x = self.maxpool(x)
+            x = self.layer1(x)
+            c3 = self.layer2(x) # Output features are from layer2, not x
+            c4 = self.layer3(c3)
+            c5 = self.layer4(c4)
+            return c3, c4, c5
+    
+    # Mock PyTorch FPN
+    class MockFPNPytorch(torch.nn.Module):
+        def __init__(self, out_channels, use_p5):
+            super().__init__()
+            self.in_channels = [512, 1024, 2048]
+            self.out_channels = out_channels
+            self.use_p5 = use_p5
+            self.lat_convs = torch.nn.ModuleList([torch.nn.Conv2d(c, out_channels, 1) for c in self.in_channels])
+            self.fpn_convs = torch.nn.ModuleList([torch.nn.Conv2d(out_channels, out_channels, 3, padding=1) for _ in self.in_channels])
+            
+            # --- START OF FIX ---
+            # 1. P6's input channel is now `out_channels` (from P5), not 2048 (from C5).
+            self.p6 = torch.nn.Conv2d(out_channels, out_channels, 3, stride=2, padding=1)
+            # --- END OF FIX ---
+
+            self.p7 = torch.nn.Conv2d(out_channels, out_channels, 3, stride=2, padding=1)
+
+        def forward(self, inputs):
+            c3, c4, c5 = inputs
+            
+            # Lateral connections
+            p5_lat = self.lat_convs[2](c5)
+            p4_lat = self.lat_convs[1](c4)
+            p3_lat = self.lat_convs[0](c3)
+            
+            # Top-down pathway
+            p4 = p4_lat + torch.nn.functional.interpolate(p5_lat, size=c4.shape[-2:], mode='nearest')
+            p3 = p3_lat + torch.nn.functional.interpolate(p4, size=c3.shape[-2:], mode='nearest')
+            
+            # Output convolutions
+            p3 = self.fpn_convs[0](p3)
+            p4 = self.fpn_convs[1](p4)
+            p5 = self.fpn_convs[2](p5_lat) # Use p5_lat here
+            
+            # --- START OF FIX ---
+            # 2. P6 now takes p5 as input, not c5.
+            p6 = self.p6(p5)
+            # --- END OF FIX ---
+            
+            p7 = self.p7(torch.nn.functional.relu(p6))
+            
+            return [p3, p4, p5, p6, p7]
+
+    # Use the self-contained PyTorch Head
+    class ScaleExpPytorch(torch.nn.Module):
+        def __init__(self,init_value=1.0):
+            super().__init__()
+            self.scale=torch.nn.Parameter(torch.tensor([init_value],dtype=torch.float32))
+        def forward(self,x):
+            return torch.exp(x*self.scale)
+
+    class ClsCntRegHeadPytorch(torch.nn.Module):
+        def __init__(self,in_channel,class_num,GN=True,cnt_on_reg=True,prior=0.01):
+            super().__init__()
+            self.cnt_on_reg=cnt_on_reg
+            cls_branch, reg_branch = [], []
+            for i in range(4):
+                cls_branch.extend([torch.nn.Conv2d(in_channel,in_channel,3,padding=1,bias=True), torch.nn.GroupNorm(32,in_channel) if GN else torch.nn.Identity(), torch.nn.ReLU(True)])
+                reg_branch.extend([torch.nn.Conv2d(in_channel,in_channel,3,padding=1,bias=True), torch.nn.GroupNorm(32,in_channel) if GN else torch.nn.Identity(), torch.nn.ReLU(True)])
+            self.cls_conv=torch.nn.Sequential(*cls_branch)
+            self.reg_conv=torch.nn.Sequential(*reg_branch)
+            self.cls_logits=torch.nn.Conv2d(in_channel,class_num,3,padding=1)
+            self.cnt_logits=torch.nn.Conv2d(in_channel,1,3,padding=1)
+            self.reg_pred=torch.nn.Conv2d(in_channel,4,3,padding=1)
+            self.scale_exp = torch.nn.ModuleList([ScaleExpPytorch(1.0) for _ in range(5)])
+
+        def forward(self,inputs):
+            cls_logits, cnt_logits, reg_preds = [], [], []
+            for i, P in enumerate(inputs):
+                cls_out, reg_out = self.cls_conv(P), self.reg_conv(P)
+                cls_logits.append(self.cls_logits(cls_out))
+                cnt_logits.append(self.cnt_logits(reg_out if self.cnt_on_reg else cls_out))
+                reg_preds.append(self.scale_exp[i](self.reg_pred(reg_out)))
+            return cls_logits, cnt_logits, reg_preds
+
+    # PyTorch FCOS Body
+    class FCOSPytorch(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.backbone = MockResNet50Pytorch()
+            self.fpn = MockFPNPytorch(config.fpn_out_channels, config.use_p5)
+            self.head = ClsCntRegHeadPytorch(config.fpn_out_channels, config.class_num, config.use_GN_head, config.cnt_on_reg, config.prior)
+        def forward(self, x):
+            c3, c4, c5 = self.backbone(x)
+            all_p = self.fpn([c3, c4, c5])
+            return self.head(all_p)
+
+    # PyTorch Detector
+    class FCOSDetectorPytorch(torch.nn.Module):
+        def __init__(self, mode="inference", config=None):
+            super().__init__()
+            self.fcos_body = FCOSPytorch(config=config)
+        def forward(self, inputs):
+            return self.fcos_body(inputs)
+
+    # --- END: Self-Contained PyTorch Implementation ---
+
+    print("--- Starting Jittor vs. PyTorch FCOSDetector Comparison ---")
+    
+    # Setup
+    if jt.has_cuda:
+        jt.flags.use_cuda = 1
+    
+    config = DefaultConfig
+    config.pretrained = False
+
+    # --- 1. Create Identical Mock Input Data ---
+    print("\nCreating mock image input...")
+    mock_image_np = np.random.randn(1, 3, 800, 800).astype('float32')
+    mock_image_jt = jt.array(mock_image_np)
+    mock_image_pt = torch.from_numpy(mock_image_np)
+
+    # --- 2. Instantiate Models ---
+    print("\nInstantiating models...")
+    jittor_detector = FCOSDetector(mode="inference", config=config)
+    pytorch_detector = FCOSDetectorPytorch(mode="inference", config=config)
+    jittor_detector.eval()
+    pytorch_detector.eval()
+
+    # --- 3. Copy Weights from PyTorch to Jittor ---
+    print("\nCopying weights...")
+    pt_params = dict(pytorch_detector.named_parameters())
+    for name, jt_param in jittor_detector.named_parameters():
+        if name in pt_params:
+            pt_param = pt_params[name]
+            if list(jt_param.shape) == list(pt_param.shape):
+                 jt_param.assign(pt_param.detach().cpu().numpy())
+    print("Weight copy complete.")
+
+    # --- 4. Run Inference ---
+    print("\nRunning inference...")
+    with jt.no_grad():
+        cls_jt, cnt_jt, reg_jt = jittor_detector.fcos_body(mock_image_jt)
+
+    with torch.no_grad():
+        cls_pt, cnt_pt, reg_pt = pytorch_detector.fcos_body(mock_image_pt)
+    print("Inference complete.")
+
+    # --- 5. Compare Outputs ---
+    print("\n--- Comparing Raw Model Outputs ---")
+    all_match = True
+    def compare_tensors(name, jt_tensor, pt_tensor, atol=1e-4):
+        global all_match
+        jt_np = jt_tensor.numpy()
+        pt_np = pt_tensor.detach().cpu().numpy()
+        if np.allclose(jt_np, pt_np, atol=atol):
+            print(f"✅ {name}: Outputs MATCH")
+        else:
+            all_match = False
+            diff = np.abs(jt_np - pt_np).max()
+            print(f"❌ {name}: Outputs DO NOT MATCH (max difference: {diff})")
+
+    for i in range(len(cls_jt)):
+        print(f"\n--- FPN Level P{i+3} ---")
+        compare_tensors(f"Cls Logits", cls_jt[i], cls_pt[i])
+        compare_tensors(f"Cnt Logits", cnt_jt[i], cnt_pt[i])
+        compare_tensors(f"Reg Preds", reg_jt[i], reg_pt[i])
+
+    print("\n--- Final Result ---")
+    if all_match:
+        print("🎉🎉🎉 All Jittor and PyTorch raw outputs are identical.")
+    else:
+        print("🔥🔥🔥 Mismatch detected in raw model outputs.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

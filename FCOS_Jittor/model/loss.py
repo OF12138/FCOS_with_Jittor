@@ -9,6 +9,30 @@ def focal_loss_from_logits(preds, targets, gamma=2.0, alpha=0.25):
     loss = -w * jt.pow((1.0 - pt), gamma) * pt.log()
     return loss.sum()
 
+def compute_iou(boxes1, boxes2):
+    """
+    Computes IoU between two sets of boxes in (x1, y1, x2, y2) format.
+    - boxes1: [N, 4]
+    - boxes2: [M, 4]
+    Returns an IoU matrix of shape [N, M].
+    """
+    px1, py1, px2, py2 = boxes1[:, 0], boxes1[:, 1], boxes1[:, 2], boxes1[:, 3]
+    tx1, ty1, tx2, ty2 = boxes2[:, 0], boxes2[:, 1], boxes2[:, 2], boxes2[:, 3]
+
+    ix1 = jt.maximum(px1.unsqueeze(1), tx1.unsqueeze(0))
+    iy1 = jt.maximum(py1.unsqueeze(1), ty1.unsqueeze(0))
+    ix2 = jt.minimum(px2.unsqueeze(1), tx2.unsqueeze(0))
+    iy2 = jt.minimum(py2.unsqueeze(1), ty2.unsqueeze(0))
+    
+    inter_w = (ix2 - ix1).clamp(min_v=0)
+    inter_h = (iy2 - iy1).clamp(min_v=0)
+    overlap = inter_w * inter_h
+
+    areas1 = (px2 - px1) * (py2 - py1)
+    areas2 = (tx2 - tx1) * (ty2 - ty1)
+    union = areas1.unsqueeze(1) + areas2.unsqueeze(0) - overlap
+    
+    return overlap / union.clamp(min_v=1e-10)
 
 #from feature map to original full-size images
 #calculate the corresponding (x,y) coordinates of each point in the original image
@@ -99,7 +123,7 @@ class GenTargets(nn.Module):
         b_off = gt_boxes[:, :, 3].unsqueeze(1) - y.unsqueeze(0).unsqueeze(2)
         return jt.stack([l_off, t_off, r_off, b_off], dim=3)
 
-    def _get_positive_mask(self, ltrb_off, stride, limit_range, gt_boxes, coords, sample_radiu_ratio=1.5):
+    def _get_positive_mask(self, ltrb_off, stride, limit_range, gt_boxes, coords, sample_radiu_ratio=2.5): #should be 1.5
         off_min = jt.min(ltrb_off, dim=3)
         off_max = jt.max(ltrb_off, dim=3)
         mask_in_gtboxes = off_min > 0
@@ -127,6 +151,74 @@ class GenTargets(nn.Module):
 
         return mask_in_gtboxes & mask_in_level & mask_center
 
+    def _get_positive_mask_with_atss(self, ltrb_off, stride, limit_range, gt_boxes, coords, sample_radiu_ratio=1.5):
+        # The new ATSS-based positive sample selection logic
+        
+        # 1. The location must be inside a ground truth box. This is a basic prerequisite.
+        off_min = jt.min(ltrb_off, dim=3)
+        mask_in_gtboxes = off_min > 0
+        
+        # 2. Reconstruct the predicted boxes for IoU calculation
+        #    coords shape: [num_points, 2] -> unsqueeze to [1, num_points, 1, 2]
+        #    ltrb_off shape: [B, num_points, num_gt, 4]
+        coords_unsqueezed = coords.unsqueeze(0).unsqueeze(2)
+        pred_boxes_x1y1 = coords_unsqueezed - ltrb_off[..., :2]
+        pred_boxes_x2y2 = coords_unsqueezed + ltrb_off[..., 2:]
+        pred_boxes = jt.concat([pred_boxes_x1y1, pred_boxes_x2y2], dim=-1)
+
+        # 3. Calculate IoU between each GT box and all locations on this level
+        ious_list = []
+        for b in range(gt_boxes.shape[0]):
+            # Filter out padded GT boxes
+            gt_boxes_b = gt_boxes[b]
+            valid_gt_mask = gt_boxes_b[:, 0] != -1
+            gt_boxes_b_valid = gt_boxes_b[valid_gt_mask]
+            
+            if gt_boxes_b_valid.numel() == 0:
+                ious_list.append(jt.zeros((coords.shape[0], gt_boxes.shape[1])))
+                continue
+
+            pred_boxes_b_valid = pred_boxes[b][:, valid_gt_mask, :]
+            
+            # Reshape for efficient IoU calculation and get the diagonal
+            # This matches each GT box with the predictions generated for it
+            iou_matrix = compute_iou(
+                pred_boxes_b_valid.reshape(-1, 4), 
+                gt_boxes_b_valid
+            ).reshape(coords.shape[0], gt_boxes_b_valid.shape[0], gt_boxes_b_valid.shape[0])
+            ious_b_valid = jt.diagonal(iou_matrix, dim1=1, dim2=2)
+            
+            # Pad back to original GT dimension size
+            padded_ious = jt.zeros((coords.shape[0], gt_boxes.shape[1]))
+            padded_ious[:, valid_gt_mask] = ious_b_valid
+            ious_list.append(padded_ious)
+        
+        ious = jt.stack(ious_list, dim=0)
+
+        # 4. Calculate the ATSS dynamic threshold (mean + std) for each GT
+        #    Use mask_in_gtboxes to ensure stats are calculated only on valid locations
+        ious_valid = jt.where(mask_in_gtboxes, ious, jt.zeros_like(ious))
+        num_in_gt = mask_in_gtboxes.sum(dim=1, keepdims=True).clamp(min_v=1)
+        
+        iou_mean = ious_valid.sum(dim=1, keepdims=True) / num_in_gt
+        iou_std = jt.sqrt(( (ious_valid - iou_mean).pow(2) * mask_in_gtboxes ).sum(dim=1, keepdims=True) / num_in_gt)
+        atss_threshold = iou_mean + iou_std
+
+        # 5. Create the final ATSS mask and combine it with the prerequisite mask
+        mask_atss = ious >= atss_threshold
+        
+        # The final positive mask is the intersection of the two conditions
+        final_mask = mask_in_gtboxes & mask_atss
+
+        # --- Debugging Print ---
+        if gt_boxes.shape[0] > 0 and gt_boxes[0,0,0].item() != -1:
+            print(f"  [GenTargets Stride {stride}] Candidates: "
+                f"in_box={mask_in_gtboxes.sum().item()}, "
+                f"pass_atss={(mask_atss & mask_in_gtboxes).sum().item()} -> "
+                f"Final Positives={final_mask.sum().item()}")
+
+        return final_mask
+        
     def _resolve_ambiguity(self, mask_pos, ltrb_off):
         areas = (ltrb_off[..., 0] + ltrb_off[..., 2]) * (ltrb_off[..., 1] + ltrb_off[..., 3])
         areas = jt.where(mask_pos, areas, jt.ones_like(areas) * 99999999.0)

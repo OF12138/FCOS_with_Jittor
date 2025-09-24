@@ -14,7 +14,7 @@ from tensorboardX import SummaryWriter
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--epochs", type=int, default=200, help="number of epochs")
+parser.add_argument("--epochs", type=int, default=5, help="number of epochs")
 parser.add_argument("--batch_size", type=int, default=1, help="size of each image batch")
 parser.add_argument("--n_cpu", type=int, default=0, help="number of cpu threads to use during batch generation")
 parser.add_argument("--n_gpu", type=str, default='0', help="not used in jittor, set via jt.flags.use_cuda")
@@ -31,6 +31,8 @@ random.seed(0)
 transform = Transforms()
 train_dataset = COCODataset("./dataset/tiny_coco/images/train2017",
                             './dataset/tiny_coco/annotations/instances_train2017.json',
+                            #"/home/openfar/Dataset/COCO/train2017/train2017",
+                            #"/home/openfar/Dataset/COCO/annotations/instances_train2017.json",
                             transform=transform,
                         )
 # set the dataloader
@@ -40,7 +42,7 @@ train_loader = DataLoader(train_dataset,
                         collate_fn=train_dataset.collate_fn,
                         )
 
-writer=SummaryWriter('logs/FCOS_experiment_f_1')
+writer=SummaryWriter('logs/FCOS_experiment_jittor_easy_2')
 model = FCOSDetector(mode="training")
 
 BATCH_SIZE = opt.batch_size
@@ -59,13 +61,13 @@ optimizer = jt.optim.SGD(model.parameters(),
                         weight_decay=0.0001,
                        )
 # train.py (New Version)
-#optimizer = jt.optim.AdamW(model.parameters(),
-#                           lr=LR_INIT,
-#                           weight_decay=0.0001
-#                          )
+""" optimizer = jt.optim.AdamW(model.parameters(),
+                           lr=LR_INIT,
+                           weight_decay=0.0001 
+                          ) """
 
 # set the learning rate scheduler
-lr_schedule = [120000, 160000]
+lr_schedule = [120000,160000]
 
 def lr_func(step):
     lr = LR_INIT
@@ -135,8 +137,9 @@ for epoch in range(EPOCHS):
 
         #optimizer.step(loss.mean())
         #optimizer.zero_grad()
-        optimizer.backward(loss)
-        optimizer.clip_grad_norm(max_norm=35.0) # Clip the gradients
+
+        optimizer.backward(loss.mean())
+        optimizer.clip_grad_norm(max_norm=3.0) # Clip the gradients
         optimizer.step() # Apply the clipped gradients
         
 
